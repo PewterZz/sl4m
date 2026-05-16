@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -12,6 +13,9 @@ from sl4m.mlx_workflow import (
     TrainRecipe,
     WorkflowError,
     detect_dataset_format,
+    parse_mlx_lora_output,
+    run_adapter_bench,
+    summarize_model_config,
     validate_dataset_dir,
 )
 
@@ -45,6 +49,8 @@ def test_validate_dataset_dir_reports_files(tmp_path: Path) -> None:
     assert report.formats["train.jsonl"] == "chat"
     assert report.formats["valid.jsonl"] == "completions"
     assert report.examples["train.jsonl"] == 1
+    assert report.train_examples == 1
+    assert report.rough_train_tokens > 0
 
 
 def test_validate_dataset_dir_requires_train(tmp_path: Path) -> None:
@@ -65,7 +71,7 @@ def test_train_recipe_command_uses_mac_memory_defaults(tmp_path: Path) -> None:
 
     cmd = recipe.to_command()
 
-    assert cmd[:3] == [sys.executable, "-m", "mlx_lm.lora"]
+    assert cmd[:4] == [sys.executable, "-m", "mlx_lm", "lora"]
     assert "--train" in cmd
     assert cmd[cmd.index("--model") + 1] == recipe.model
     assert cmd[cmd.index("--data") + 1] == str(tmp_path)
@@ -74,6 +80,86 @@ def test_train_recipe_command_uses_mac_memory_defaults(tmp_path: Path) -> None:
     assert cmd[cmd.index("--grad-accumulation-steps") + 1] == "4"
     assert "--grad-checkpoint" in cmd
     assert "--mask-prompt" in cmd
+
+
+def test_train_recipe_command_includes_hard_test_knobs(tmp_path: Path) -> None:
+    _write_jsonl(tmp_path / "train.jsonl", [{"text": "hello"}])
+
+    cmd = TrainRecipe(
+        model="mlx-community/test",
+        data=tmp_path,
+        optimizer="adamw",
+        val_batches=1,
+        max_seq_length=256,
+        clear_cache_threshold=1_000_000,
+    ).to_command()
+
+    assert cmd[cmd.index("--optimizer") + 1] == "adamw"
+    assert cmd[cmd.index("--val-batches") + 1] == "1"
+    assert cmd[cmd.index("--max-seq-length") + 1] == "256"
+    assert cmd[cmd.index("--clear-cache-threshold") + 1] == "1000000"
+
+
+def test_train_recipe_writes_lora_parameter_config(tmp_path: Path) -> None:
+    _write_jsonl(tmp_path / "train.jsonl", [{"text": "hello"}])
+    cfg_path = tmp_path / "adapter" / "slam_lora_config.json"
+
+    recipe = TrainRecipe(
+        model="mlx-community/test",
+        data=tmp_path,
+        adapter_path=tmp_path / "adapter",
+        lora_rank=16,
+        lora_scale=32.0,
+        lora_dropout=0.05,
+    ).write_config(cfg_path)
+
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    cmd = recipe.to_command()
+
+    assert cfg["lora_parameters"] == {"rank": 16, "scale": 32.0, "dropout": 0.05}
+    assert cmd == [sys.executable, "-m", "mlx_lm", "lora", "--config", str(cfg_path)]
+
+
+def test_run_adapter_bench_sweeps_learning_rates(tmp_path: Path, monkeypatch) -> None:
+    data = tmp_path / "data"
+    data.mkdir()
+    _write_jsonl(data / "train.jsonl", [{"text": "hello"}])
+
+    seen_configs: list[dict] = []
+
+    def fake_run(args, capture_output, text, check):
+        assert args[:4] == [sys.executable, "-m", "mlx_lm", "lora"]
+        cfg_path = Path(args[-1])
+        seen_configs.append(json.loads(cfg_path.read_text(encoding="utf-8")))
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout=(
+                "Trainable parameters: 0.007% (0.639M/8953.802M)\n"
+                "Iter 1: Train loss 1.000, Learning Rate 1.000e-05, "
+                "It/sec 1.000, Tokens/sec 10.000, Trained Tokens 10, Peak mem 1.000 GB"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("sl4m.mlx_workflow.subprocess.run", fake_run)
+
+    results = run_adapter_bench(
+        model="mlx-community/test",
+        data=data,
+        output_dir=tmp_path / "runs",
+        fine_tune_types=["lora"],
+        num_layers=[1],
+        ranks=[4],
+        scales=[16],
+        dropouts=[0],
+        learning_rates=[1e-5, 2e-5],
+        iters=1,
+    )
+
+    assert [r.learning_rate for r in results] == [1e-5, 2e-5]
+    assert [cfg["learning_rate"] for cfg in seen_configs] == [1e-5, 2e-5]
+    assert all("lr" in r.name for r in results)
 
 
 def test_train_recipe_from_toml(tmp_path: Path) -> None:
@@ -102,12 +188,124 @@ mask_prompt = false
     assert recipe.mask_prompt is False
 
 
+def test_train_recipe_plan_reads_local_model_config(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    data.mkdir()
+    _write_jsonl(data / "train.jsonl", [{"text": "hello world"} for _ in range(9)])
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3",
+                "hidden_size": 4096,
+                "intermediate_size": 12288,
+                "num_hidden_layers": 32,
+                "num_attention_heads": 32,
+                "quantization": {"bits": 4},
+            }
+        ),
+        encoding="utf-8",
+    )
+    recipe = TrainRecipe(
+        model=str(model),
+        data=data,
+        iters=20,
+        batch_size=2,
+        grad_accumulation_steps=2,
+        num_layers=12,
+    )
+
+    plan = recipe.plan()
+
+    assert plan.model_config.model_type == "qwen3"
+    assert plan.model_config.quantization_bits == 4
+    assert plan.effective_batch_size == 4
+    assert plan.optimizer_steps_per_epoch == 3
+    assert plan.estimated_epochs == pytest.approx(20 / 3)
+    assert plan.trainable_layer_count == 12
+
+
+def test_train_recipe_plan_reads_nested_text_config(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    data.mkdir()
+    _write_jsonl(data / "train.jsonl", [{"text": "hello"}])
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_5",
+                "quantization": {"bits": 4},
+                "text_config": {
+                    "hidden_size": 4096,
+                    "intermediate_size": 12288,
+                    "num_hidden_layers": 32,
+                    "num_attention_heads": 16,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    plan = TrainRecipe(model=str(model), data=data, num_layers=-1).plan()
+
+    assert plan.model_config.hidden_size == 4096
+    assert plan.model_config.intermediate_size == 12288
+    assert plan.model_config.num_hidden_layers == 32
+    assert plan.trainable_layer_count == 32
+
+
+def test_summarize_model_config_missing_config_is_unknown(tmp_path: Path) -> None:
+    summary = summarize_model_config(tmp_path)
+
+    assert summary.path is None
+    assert summary.hidden_size is None
+
+
 def test_eval_recipe_requires_test_jsonl(tmp_path: Path) -> None:
     _write_jsonl(tmp_path / "train.jsonl", [{"text": "hello"}])
     recipe = EvalRecipe(model="mlx-community/test", data=tmp_path)
 
     with pytest.raises(WorkflowError, match="test.jsonl"):
         recipe.to_command()
+
+
+def test_eval_recipe_command_supports_small_test_batch(tmp_path: Path) -> None:
+    _write_jsonl(tmp_path / "test.jsonl", [{"text": "hello"}])
+
+    cmd = EvalRecipe(
+        model="mlx-community/test",
+        data=tmp_path,
+        batch_size=1,
+        test_batches=1,
+    ).to_command()
+
+    assert cmd[:4] == [sys.executable, "-m", "mlx_lm", "lora"]
+    assert cmd[cmd.index("--batch-size") + 1] == "1"
+    assert cmd[cmd.index("--test-batches") + 1] == "1"
+    assert "--test" in cmd
+
+
+def test_parse_mlx_lora_output() -> None:
+    metrics = parse_mlx_lora_output(
+        """
+Trainable parameters: 0.007% (0.639M/8953.802M)
+Iter 2: Val loss 1.198, Val took 1.062s
+Iter 2: Train loss 1.052, Learning Rate 1.000e-05, It/sec 2.052, Tokens/sec 13.955, Trained Tokens 68, Peak mem 6.148 GB
+Test loss 2.045, Test ppl 7.731.
+""".strip()
+    )
+
+    assert metrics["trainable_pct"] == 0.007
+    assert metrics["trainable_params_m"] == 0.639
+    assert metrics["val_loss"] == 1.198
+    assert metrics["train_loss"] == 1.052
+    assert metrics["tokens_per_sec"] == 13.955
+    assert metrics["trained_tokens"] == 68
+    assert metrics["peak_mem_gb"] == 6.148
+    assert metrics["test_loss"] == 2.045
+    assert metrics["test_ppl"] == 7.731
 
 
 def test_serve_recipe_command_includes_adapters_and_draft(tmp_path: Path) -> None:

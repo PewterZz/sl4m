@@ -1,0 +1,25 @@
+[task]
+name = "pytest_fix"
+context = """
+def normalize_name(name):
+    return name.strip().lower()
+
+
+def test_normalize_name_handles_none():
+    assert normalize_name(None) == ""
+
+
+def test_normalize_name_strips_and_lowers():
+    assert normalize_name(" Ada ") == "ada"
+"""
+instruction = """
+Fix the implementation so the tests pass. Preserve the tests, return only Python code, and keep the function name.
+"""
+output = "code"
+max_tokens = 192
+temperature = 0.0
+validations = [
+  "python-ast",
+  "py-compile",
+  { kind = "contains", value = "def normalize_name" },
+]

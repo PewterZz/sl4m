@@ -5,6 +5,14 @@ An adaptive LLM runtime for running big models on constrained hardware.
 Targets the cases current tools do poorly:
 - 30-80B MoE models (A3B-style) on a laptop with 6-8GB VRAM + DDR4 RAM
 - Dense models on M-series Macs where unified memory pressure fluctuates with your workflow
+- Coding-agent edit/refactor loops where prompt structure repeats and decode strategy can be routed per task
+
+Current measured position: sl4m is not yet broadly better than MLX-LM,
+llama.cpp, Unsloth, or Cider across all workloads. It is already competitive
+with MLX-LM baseline on Apple Silicon and faster on measured Mac coding-agent
+edit/refactor tasks through PLD/adaptive PLD routing. The goal is to turn that
+narrow win into a reproducible Mac-first training, fine-tuning, and serving
+stack with explicit benchmarks against the popular libraries.
 
 ## Quickstart
 
@@ -32,6 +40,14 @@ Fine-tune and serve on Apple Silicon:
 # Dataset preflight. train.jsonl is required for training; valid.jsonl is optional.
 slam mlx-check-data data/my-sft
 
+# Plan the run before committing hours of Mac time.
+slam mlx-train-plan \
+  --model ~/Tools/models/Huihui-OmniCoder-9B-abliterated-4bit \
+  --data data/my-sft \
+  --batch-size 1 \
+  --grad-accumulation-steps 4 \
+  --iters 600
+
 # QLoRA if the base is already quantized, regular LoRA otherwise.
 slam mlx-train \
   --model mlx-community/Qwen2.5-Coder-7B-Instruct-4bit \
@@ -46,7 +62,7 @@ slam mlx-train --recipe configs/mac_lora_example.toml
 
 # Evaluate on test.jsonl, then fuse adapters into a standalone MLX model.
 slam mlx-eval --model mlx-community/Qwen2.5-Coder-7B-Instruct-4bit \
-  --data data/my-sft --adapter-path adapters/qwen2.5-coder
+  --data data/my-sft --adapter-path adapters/qwen2.5-coder --batch-size 1
 slam mlx-fuse --model mlx-community/Qwen2.5-Coder-7B-Instruct-4bit \
   --adapter-path adapters/qwen2.5-coder --save-path fused/qwen2.5-coder
 
@@ -58,6 +74,58 @@ slam mlx-serve --model mlx-community/Qwen2.5-Coder-7B-Instruct-4bit \
 MLX-LM accepts local JSONL datasets in `chat`, `tools`, `completions`, or
 `text` format. `slam mlx-check-data` validates the split files before a
 long Mac training run starts.
+
+Tiny local smoke training is available for pipeline checks:
+
+```bash
+slam mlx-train \
+  --model ~/Tools/models/Huihui-OmniCoder-9B-abliterated-4bit \
+  --data benchmarks/finetune_smoke \
+  --adapter-path runs/adapters/omnicoder-9b-smoke \
+  --iters 2 \
+  --batch-size 1 \
+  --grad-accumulation-steps 1 \
+  --num-layers 1
+
+slam mlx-eval \
+  --model ~/Tools/models/Huihui-OmniCoder-9B-abliterated-4bit \
+  --data benchmarks/finetune_smoke \
+  --adapter-path runs/adapters/omnicoder-9b-smoke \
+  --batch-size 1 \
+  --test-batches 1
+```
+
+This is a pipeline smoke test, not a quality recipe. On the local OmniCoder 9B
+4-bit model, the 2-iteration run trained 0.639M parameters, reached 13.955
+tokens/s, peaked at 6.148 GB, and saved a 2.4 MB adapter.
+
+For harder adapter sweeps, use `mlx-adapter-bench`:
+
+```bash
+slam mlx-adapter-bench \
+  --model ~/Tools/models/Huihui-OmniCoder-9B-abliterated-4bit \
+  --data benchmarks/finetune_smoke \
+  --output-dir runs/adapter-bench/omnicoder-9b-smoke \
+  --fine-tune-types lora,dora \
+  --layers 1,2,4 \
+  --ranks 4,8,16 \
+  --scales 16,20 \
+  --learning-rates 1e-5,2e-5 \
+  --iters 2 \
+  --batch-size 1 \
+  --val-batches 1 \
+  --test-batches 1 \
+  --jsonl runs/adapter-bench-omnicoder-9b-smoke.jsonl
+```
+
+Initial 9B smoke matrix: LoRA-4 gave the best test loss (`1.968`) at 6.879 GB
+peak memory and 10.3 MB adapter size. DoRA-4 was similar quality (`1.972`) but
+used 11.602 GB peak memory, so LoRA is the current default for Mac sweeps.
+Rank/scale sweeps are supported through generated MLX-LM config files; on the
+same smoke set, rank-16/scale-20 was the best 1-layer LoRA point (`2.028` test
+loss) while staying near 6.15 GB peak memory. Learning-rate sweeps are part of
+the same matrix so short adapter searches can compare quality, speed, and memory
+without changing harnesses.
 
 Don't know which draft pair works for your target? `slam spec-sweep` tries
 `num_draft ∈ {1,2,4,6,8}` and prints a ranked table.
@@ -85,8 +153,9 @@ Measured wins on a RTX 3060 Laptop 6 GB: **+35%** on OmniCoder 9B (24 → 32.3 t
 | your situation | reach for |
 |---|---|
 | Mac, writing new code | `spec` (target + small draft of same family) |
-| Mac, editing / refactoring existing code | `pld` (draftless; wins from prompt repetition) |
-| Mac, long-context edit + wants correctness gate | `pld --temperature 0.0` (auto baseline diff) |
+| Mac, editing / refactoring existing code | `agent-run` / `agent-bench` auto route to adaptive PLD |
+| Mac, long-context edit + wants correctness gate | `pld --temperature 0.0` or `agent-bench` validators |
+| Mac, preparing fine-tuning | `mlx-check-data` then `mlx-train-plan` before `mlx-train` |
 | Linux laptop GPU, just want best t/s | `lc-sweep` then paste the winning command |
 | Linux laptop GPU, MoE model (A3B-style) | `lc-sweep` — it's MoE-aware, sweeps `--n-cpu-moe` |
 | Investigating an MoE's routing skew | `tools/routing_observe.py` |
@@ -115,12 +184,16 @@ What's interface-only (NotImplementedError):
 
 New Mac/MLX training surface:
 - `slam mlx-check-data` — validates MLX-LM JSONL datasets before training/eval
+- `slam mlx-train-plan` — estimates effective batch, steps/epoch, rough token volume, trainable layers, and local model config
 - `slam mlx-train` — LoRA/QLoRA/DoRA/full fine-tuning wrapper with Mac-safe defaults
+- `slam mlx-adapter-bench` — runs LoRA/DoRA/layer-count sweeps and writes train/eval JSONL
 - `slam mlx-eval` — adapter perplexity eval through MLX-LM
 - `slam mlx-fuse` — fuse adapters into standalone MLX models
 - `slam mlx-serve` — OpenAI-compatible local serving through `mlx_lm.server`
 - `slam mac-profile` — captures Mac/MLX runtime metadata for benchmark runs
 - `slam mac-bench` — compares slam Mac generation modes with JSONL output
+- `slam mac-kv-bench` — compares FP/8-bit/4-bit MLX KV cache modes
+- `slam determinism-bench` — repeats baseline/PLD/adaptive/KV modes and records token drift
 - `slam mac-kernel-bench` — benchmarks custom Metal kernels vs MLX reference ops
 
 Mac efficiency work lives in [docs/mac-efficiency-roadmap.md](docs/mac-efficiency-roadmap.md).
@@ -139,10 +212,34 @@ slam mac-linear-bench --profile tiny --repeats 20
 slam mac-linear-bench --shapes 1x4096x4096,256x4096x14336 --repeats 10
 ```
 
-For the first row-wise reduction candidate:
+For row-wise reduction candidates, benchmark plain RMSNorm and residual-add
+RMSNorm fusion:
 
 ```bash
 slam mac-norm-bench --rows 256 --hidden 4096 --repeats 50
+```
+
+2026 KV-cache compression work such as TurboQuant belongs on the inference
+track, not the adapter-training track. The practical sl4m next step is a
+TurboQuant-inspired KV harness for long-context agent cache memory and quality
+before attempting custom Metal cache kernels.
+
+```bash
+slam mac-kv-bench ~/Tools/models/Huihui-OmniCoder-9B-abliterated-4bit \
+  --kv-bits none,8,4 \
+  --max-tokens 64 \
+  --jsonl runs/kv-bench-omnicoder-9b-smoke.jsonl
+```
+
+For agentic workflows, run deterministic repeat checks before treating an
+optimized mode as production-safe:
+
+```bash
+slam determinism-bench ~/Tools/models/Huihui-OmniCoder-9B-abliterated-4bit \
+  --modes baseline,pld,adaptive-pld,kv-8bit,kv-4bit \
+  --repeats 3 \
+  --temperature 0.0 \
+  --jsonl runs/determinism-omnicoder-9b-smoke.jsonl
 ```
 
 Real-model smoke tests are opt-in so normal CI does not download weights:
@@ -160,8 +257,10 @@ slam mac-compare ~/Tools/models/Huihui-OmniCoder-9B-abliterated-4bit \
   --jsonl runs/omnicoder-9b-direct-vs-slam.jsonl
 ```
 
-For coding-agent tasks, `agent-run` routes edit-shaped prompts to PLD and keeps
-open-ended prompts on baseline:
+For coding-agent tasks, `agent-run` routes edit-shaped prompts to adaptive PLD
+and keeps open-ended prompts on baseline. Adaptive PLD starts with prompt lookup
+and falls back to baseline continuation when early lookup rounds show too few
+matches or accepted draft tokens:
 
 ```bash
 slam agent-run ~/Tools/models/Huihui-OmniCoder-9B-abliterated-4bit \
@@ -169,6 +268,15 @@ slam agent-run ~/Tools/models/Huihui-OmniCoder-9B-abliterated-4bit \
 
 Refactor the code above for clarity. Preserve behavior and return only updated code." \
   --max-tokens 256
+```
+
+Benchmark agent workflows across baseline, PLD, adaptive PLD, and auto routing:
+
+```bash
+slam agent-bench benchmarks/agent_tasks \
+  --model ~/Tools/models/Huihui-OmniCoder-9B-abliterated-4bit \
+  --modes baseline,pld,adaptive-pld,agent-auto \
+  --jsonl runs/agent-bench.jsonl
 ```
 
 ## Speculative decoding

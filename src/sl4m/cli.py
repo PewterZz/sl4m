@@ -9,7 +9,14 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from .adaptive_pld import resolve_agent_mode
 from .agent import route_agent_prompt
+from .agent_bench import (
+    load_agent_tasks,
+    run_agent_bench,
+    validate_modes,
+    write_agent_bench_jsonl,
+)
 from .backend import GenerationSettings, LlamaCppBackend, MLXBackend
 from .budget import StaticBudget, Tier, auto_detect_limits
 from .kernel_harness import (
@@ -22,7 +29,9 @@ from .mac_efficiency import (
     build_mac_acceleration_plan,
     collect_mac_profile,
     compare_mlx_lm_vs_slam,
+    run_determinism_bench,
     run_fused_silu_mul_bench,
+    run_kv_cache_bench,
     run_mlx_generation_bench,
     run_rms_norm_bench,
     summarize_by_best,
@@ -33,9 +42,11 @@ from .mlx_workflow import (
     EvalRecipe,
     FuseRecipe,
     ServeRecipe,
+    TrainPlan,
     TrainRecipe,
     WorkflowError,
     ensure_macos,
+    run_adapter_bench,
     run_command,
     validate_dataset_dir,
 )
@@ -108,7 +119,7 @@ def run(
 def agent_run(
     model: str = typer.Argument(..., help="HF repo id or local MLX model path"),
     prompt: str = typer.Option(..., help="Agent task prompt"),
-    mode: str = typer.Option("auto", help="auto | baseline | pld"),
+    mode: str = typer.Option("auto", help="auto | baseline | pld | adaptive-pld"),
     max_tokens: int = typer.Option(256),
     temperature: float = typer.Option(0.0),
     num_draft: int = typer.Option(4),
@@ -120,9 +131,9 @@ def agent_run(
 ):
     """Run an agentic prompt with conservative auto-routing for Mac edit workflows."""
     route = route_agent_prompt(prompt)
-    selected_mode = route.mode if mode == "auto" else mode
-    if selected_mode not in {"baseline", "pld"}:
-        raise typer.BadParameter("mode must be auto, baseline, or pld")
+    selected_mode = resolve_agent_mode(mode, route.mode)
+    if selected_mode not in {"baseline", "pld", "adaptive-pld"}:
+        raise typer.BadParameter("mode must be auto, baseline, pld, or adaptive-pld")
 
     console.print(
         f"[cyan]agent route[/cyan] mode={selected_mode} "
@@ -158,6 +169,14 @@ def agent_run(
                 max_ngram_size=max_ngram,
                 min_ngram_size=min_ngram,
             )
+        elif selected_mode == "adaptive-pld":
+            stream = session.generate_adaptive_pld(
+                prompt,
+                settings,
+                num_draft=num_draft,
+                max_ngram_size=max_ngram,
+                min_ngram_size=min_ngram,
+            )
         else:
             stream = session.generate(prompt, settings)
         for tok in stream:
@@ -165,6 +184,74 @@ def agent_run(
         console.print()
     finally:
         session.close()
+
+
+@app.command("agent-bench")
+def agent_bench(
+    tasks_path: str = typer.Argument(..., help="TOML task file or directory of task files"),
+    model: Optional[str] = typer.Option(None, help="HF repo id or local MLX model path"),
+    modes: str = typer.Option("baseline,pld,adaptive-pld,agent-auto"),
+    headroom_gb: float = typer.Option(4.0),
+    num_draft: int = typer.Option(4),
+    max_ngram: int = typer.Option(3),
+    min_ngram: int = typer.Option(2),
+    jsonl: Optional[str] = typer.Option(None),
+    dry_run: bool = typer.Option(False, help="Validate tasks and print routing without loading a model"),
+):
+    """Benchmark agentic edit tasks across baseline, PLD, adaptive PLD, and auto routing."""
+    try:
+        tasks = load_agent_tasks(tasks_path)
+        selected_modes = validate_modes([m.strip() for m in modes.split(",")])
+    except ValueError as e:
+        raise typer.BadParameter(str(e)) from e
+
+    if dry_run:
+        table = Table(title="Agent benchmark tasks")
+        table.add_column("task")
+        table.add_column("prompt chars", justify="right")
+        table.add_column("auto")
+        table.add_column("confidence", justify="right")
+        table.add_column("validations")
+        for task in tasks:
+            route = route_agent_prompt(task.prompt)
+            table.add_row(
+                task.name,
+                str(len(task.prompt)),
+                route.mode,
+                f"{route.confidence:.2f}",
+                ",".join(v.kind for v in task.validations) or "none",
+            )
+        console.print(table)
+        return
+
+    if not model:
+        raise typer.BadParameter("--model is required unless --dry-run is set")
+
+    results = run_agent_bench(
+        tasks=tasks,
+        model=model,
+        modes=selected_modes,
+        headroom_gb=headroom_gb,
+        num_draft=num_draft,
+        max_ngram=max_ngram,
+        min_ngram=min_ngram,
+    )
+    table = Table(title="Agent benchmark")
+    for col in ("task", "mode", "selected", "tokens", "tok/s", "valid", "peak GB"):
+        table.add_column(col, justify="right" if col in {"tokens", "tok/s", "peak GB"} else "left")
+    for result in results:
+        table.add_row(
+            result.task,
+            result.mode,
+            result.selected_mode,
+            str(result.tokens),
+            f"{result.tok_s:.2f}",
+            "yes" if result.validation_ok else "no",
+            f"{result.peak_mem_gb:.2f}" if result.peak_mem_gb is not None else "n/a",
+        )
+    console.print(table)
+    if jsonl:
+        write_agent_bench_jsonl(jsonl, results)
 
 
 @app.command("mlx-check-data")
@@ -201,7 +288,7 @@ def mlx_train(
     grad_checkpoint: bool = typer.Option(True, help="Trade compute for lower memory"),
     mask_prompt: bool = typer.Option(True, help="Train loss on completions only for chat/completion data"),
     recipe: Optional[str] = typer.Option(None, help="TOML recipe with a [train] table"),
-    dry_run: bool = typer.Option(False, help="Print the mlx_lm.lora command without running it"),
+    dry_run: bool = typer.Option(False, help="Print the MLX-LM LoRA command without running it"),
 ):
     """Mac-first LoRA/QLoRA/DoRA fine-tuning via MLX-LM."""
     try:
@@ -236,11 +323,76 @@ def mlx_train(
     raise typer.Exit(run_command(cfg.to_command(), dry_run=dry_run))
 
 
+def _render_train_plan(plan: TrainPlan) -> None:
+    table = Table(title="MLX training plan")
+    table.add_column("Field")
+    table.add_column("Value")
+    cfg = plan.model_config
+    table.add_row("model", plan.recipe.model)
+    table.add_row("model_type", cfg.model_type or "unknown")
+    table.add_row("hidden", str(cfg.hidden_size or "unknown"))
+    table.add_row("layers", str(cfg.num_hidden_layers or "unknown"))
+    table.add_row("heads", str(cfg.num_attention_heads or "unknown"))
+    table.add_row("quant_bits", str(cfg.quantization_bits or "unknown"))
+    table.add_row("data", str(plan.dataset.path))
+    table.add_row("train_examples", str(plan.dataset.train_examples))
+    table.add_row("rough_train_tokens", str(plan.dataset.rough_train_tokens))
+    table.add_row("effective_batch", str(plan.effective_batch_size))
+    table.add_row("steps_per_epoch", str(plan.optimizer_steps_per_epoch))
+    table.add_row("iters", str(plan.recipe.iters))
+    table.add_row("estimated_epochs", f"{plan.estimated_epochs:.2f}")
+    table.add_row("trainable_layers", str(plan.trainable_layer_count or "unknown"))
+    table.add_row("rough_tokens_per_step", str(plan.rough_tokens_per_step))
+    console.print(table)
+
+
+@app.command("mlx-train-plan")
+def mlx_train_plan(
+    model: Optional[str] = typer.Option(None, help="HF repo id or local MLX model path"),
+    data: Optional[str] = typer.Option(None, help="Dataset directory with train.jsonl"),
+    adapter_path: str = typer.Option("adapters", help="Where adapter weights are written"),
+    fine_tune_type: str = typer.Option("lora", help="lora | dora | full"),
+    iters: int = typer.Option(600),
+    batch_size: int = typer.Option(1),
+    learning_rate: float = typer.Option(1e-5),
+    num_layers: int = typer.Option(16, help="-1 means all layers"),
+    grad_accumulation_steps: int = typer.Option(1),
+    grad_checkpoint: bool = typer.Option(True),
+    mask_prompt: bool = typer.Option(True),
+    recipe: Optional[str] = typer.Option(None, help="TOML recipe with a [train] table"),
+):
+    """Estimate Mac MLX fine-tuning shape before launching a long run."""
+    try:
+        if recipe:
+            cfg = TrainRecipe.from_toml(recipe)
+        else:
+            if not model or not data:
+                raise WorkflowError("provide --model and --data, or --recipe")
+            cfg = TrainRecipe(
+                model=model,
+                data=Path(data),
+                adapter_path=Path(adapter_path),
+                fine_tune_type=fine_tune_type,
+                iters=iters,
+                batch_size=batch_size,
+                learning_rate=learning_rate,
+                num_layers=num_layers,
+                grad_accumulation_steps=grad_accumulation_steps,
+                grad_checkpoint=grad_checkpoint,
+                mask_prompt=mask_prompt,
+            )
+        _render_train_plan(cfg.plan())
+    except WorkflowError as e:
+        raise typer.BadParameter(str(e)) from e
+
+
 @app.command("mlx-eval")
 def mlx_eval(
     model: str = typer.Option(..., help="HF repo id or local MLX model path"),
     data: str = typer.Option(..., help="Dataset directory with test.jsonl"),
     adapter_path: str = typer.Option("adapters"),
+    batch_size: int = typer.Option(4),
+    test_batches: int = typer.Option(-1),
     dry_run: bool = typer.Option(False),
 ):
     """Evaluate adapter perplexity through MLX-LM."""
@@ -251,11 +403,105 @@ def mlx_eval(
             model=model,
             data=Path(data),
             adapter_path=Path(adapter_path),
+            batch_size=batch_size,
+            test_batches=test_batches,
         )
         cfg.validate()
     except WorkflowError as e:
         raise typer.BadParameter(str(e)) from e
     raise typer.Exit(run_command(cfg.to_command(), dry_run=dry_run))
+
+
+@app.command("mlx-adapter-bench")
+def mlx_adapter_bench(
+    model: str = typer.Option(..., help="HF repo id or local MLX model path"),
+    data: str = typer.Option(..., help="Dataset directory with train/valid/test JSONL"),
+    output_dir: str = typer.Option("runs/adapter-bench"),
+    fine_tune_types: str = typer.Option("lora,dora", help="Comma-separated: lora,dora,full"),
+    layers: str = typer.Option("1,2", help="Comma-separated layer counts, e.g. 1,2,4"),
+    ranks: str = typer.Option("8", help="Comma-separated LoRA ranks, e.g. 4,8,16"),
+    scales: str = typer.Option("20", help="Comma-separated LoRA alpha/scale values"),
+    dropouts: str = typer.Option("0", help="Comma-separated LoRA dropout values"),
+    learning_rates: str = typer.Option("1e-5", help="Comma-separated learning rates"),
+    iters: int = typer.Option(2),
+    batch_size: int = typer.Option(1),
+    grad_accumulation_steps: int = typer.Option(1),
+    optimizer: Optional[str] = typer.Option(None),
+    val_batches: int = typer.Option(1),
+    test_batches: int = typer.Option(1),
+    max_seq_length: Optional[int] = typer.Option(None),
+    seed: Optional[int] = typer.Option(0),
+    jsonl: Optional[str] = typer.Option(None, help="Write benchmark records as JSONL"),
+):
+    """Run a small LoRA/DoRA adapter matrix and log train/eval metrics."""
+    try:
+        ensure_macos()
+        selected_types = [x.strip() for x in fine_tune_types.split(",") if x.strip()]
+        selected_layers = [int(x.strip()) for x in layers.split(",") if x.strip()]
+        selected_ranks = [int(x.strip()) for x in ranks.split(",") if x.strip()]
+        selected_scales = [float(x.strip()) for x in scales.split(",") if x.strip()]
+        selected_dropouts = [float(x.strip()) for x in dropouts.split(",") if x.strip()]
+        selected_learning_rates = [
+            float(x.strip()) for x in learning_rates.split(",") if x.strip()
+        ]
+        results = run_adapter_bench(
+            model=model,
+            data=Path(data),
+            output_dir=Path(output_dir),
+            fine_tune_types=selected_types,
+            num_layers=selected_layers,
+            ranks=selected_ranks,
+            scales=selected_scales,
+            dropouts=selected_dropouts,
+            learning_rates=selected_learning_rates,
+            iters=iters,
+            batch_size=batch_size,
+            grad_accumulation_steps=grad_accumulation_steps,
+            optimizer=optimizer,
+            val_batches=val_batches,
+            test_batches=test_batches,
+            max_seq_length=max_seq_length,
+            seed=seed,
+        )
+    except ValueError as e:
+        raise typer.BadParameter(str(e)) from e
+    except WorkflowError as e:
+        raise typer.BadParameter(str(e)) from e
+
+    table = Table(title="MLX adapter benchmark")
+    for col in (
+        "name",
+        "rank",
+        "scale",
+        "lr",
+        "rc",
+        "eval",
+        "train loss",
+        "val loss",
+        "test loss",
+        "tok/s",
+        "peak GB",
+        "adapter MB",
+    ):
+        table.add_column(col, justify="right" if col != "name" else "left")
+    for result in results:
+        table.add_row(
+            result.name,
+            str(result.rank or "n/a"),
+            "n/a" if result.scale is None else f"{result.scale:g}",
+            f"{result.learning_rate:g}",
+            str(result.train_returncode),
+            "n/a" if result.eval_returncode is None else str(result.eval_returncode),
+            "n/a" if result.train_loss is None else f"{result.train_loss:.3f}",
+            "n/a" if result.val_loss is None else f"{result.val_loss:.3f}",
+            "n/a" if result.test_loss is None else f"{result.test_loss:.3f}",
+            "n/a" if result.tokens_per_sec is None else f"{result.tokens_per_sec:.2f}",
+            "n/a" if result.peak_mem_gb is None else f"{result.peak_mem_gb:.2f}",
+            "n/a" if result.adapter_size_mb is None else f"{result.adapter_size_mb:.2f}",
+        )
+    console.print(table)
+    if jsonl:
+        write_jsonl(jsonl, [r.to_record() for r in results])
 
 
 @app.command("mlx-fuse")
@@ -394,6 +640,115 @@ def mac_bench(
                 console.print(f"[green]{r.name} vs {baseline.name}: {r.tok_s / baseline.tok_s:.2f}×[/green]")
     if jsonl:
         write_jsonl(jsonl, results)
+
+
+@app.command("mac-kv-bench")
+def mac_kv_bench(
+    model: str = typer.Argument(..., help="HF repo id or local MLX model path"),
+    prompt: str = typer.Option(
+        "Summarize the following codebase notes, then propose three refactors.\n" * 80,
+    ),
+    kv_bits: str = typer.Option("none,8,4", help="Comma-separated KV modes: none,8,4"),
+    max_tokens: int = typer.Option(128),
+    temperature: float = typer.Option(0.0),
+    repeats: int = typer.Option(1),
+    kv_group_size: int = typer.Option(64),
+    quantized_kv_start: int = typer.Option(0),
+    headroom_gb: float = typer.Option(4.0),
+    jsonl: Optional[str] = typer.Option(None),
+):
+    """Benchmark MLX KV-cache quantization as the baseline for TurboQuant work."""
+    selected_bits: list[Optional[int]] = []
+    for item in (x.strip().lower() for x in kv_bits.split(",") if x.strip()):
+        selected_bits.append(None if item in {"none", "fp", "bf16", "fp16"} else int(item))
+    results = run_kv_cache_bench(
+        model=model,
+        prompt=prompt,
+        kv_bits=selected_bits,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        repeats=repeats,
+        headroom_gb=headroom_gb,
+        kv_group_size=kv_group_size,
+        quantized_kv_start=quantized_kv_start,
+    )
+    table = Table(title="Mac KV cache benchmark")
+    for col in ("mode", "tokens", "seconds", "tok/s", "ttft", "peak GB"):
+        table.add_column(col, justify="right" if col != "mode" else "left")
+    for r in results:
+        table.add_row(
+            r.name,
+            str(r.tokens),
+            f"{r.seconds:.2f}",
+            f"{r.tok_s:.2f}",
+            f"{(r.first_token_s or 0.0):.3f}",
+            f"{r.peak_mem_gb:.2f}" if r.peak_mem_gb is not None else "n/a",
+        )
+    console.print(table)
+    if jsonl:
+        write_jsonl(jsonl, [r.to_record() for r in results])
+
+
+@app.command("determinism-bench")
+def determinism_bench(
+    model: str = typer.Argument(..., help="HF repo id or local MLX model path"),
+    prompt: str = typer.Option(
+        "Return a deterministic JSON object with keys task, plan, and risks.",
+    ),
+    modes: str = typer.Option(
+        "baseline,pld,adaptive-pld,kv-8bit,kv-4bit",
+        help="Comma-separated: baseline,pld,adaptive-pld,kv-fp,kv-8bit,kv-4bit",
+    ),
+    max_tokens: int = typer.Option(128),
+    temperature: float = typer.Option(0.0),
+    top_p: float = typer.Option(0.95),
+    repeats: int = typer.Option(3),
+    num_draft: int = typer.Option(4),
+    max_ngram: int = typer.Option(3),
+    min_ngram: int = typer.Option(2),
+    kv_group_size: int = typer.Option(64),
+    quantized_kv_start: int = typer.Option(0),
+    headroom_gb: float = typer.Option(4.0),
+    jsonl: Optional[str] = typer.Option(None),
+):
+    """Check token-level repeatability of slam inference modes."""
+    selected = [m.strip() for m in modes.split(",") if m.strip()]
+    results = run_determinism_bench(
+        model=model,
+        prompt=prompt,
+        modes=selected,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        repeats=repeats,
+        headroom_gb=headroom_gb,
+        num_draft=num_draft,
+        max_ngram=max_ngram,
+        min_ngram=min_ngram,
+        kv_group_size=kv_group_size,
+        quantized_kv_start=quantized_kv_start,
+    )
+    table = Table(title="Determinism benchmark")
+    for col in ("mode", "repeat", "tokens", "tok/s", "match", "diverge", "hash"):
+        table.add_column(
+            col,
+            justify="right" if col in {"repeat", "tokens", "tok/s", "diverge"} else "left",
+        )
+    for r in results:
+        table.add_row(
+            r.name,
+            str(r.metadata["repeat"]),
+            str(r.tokens),
+            f"{r.tok_s:.2f}",
+            "yes" if r.metadata["matches_first"] else "no",
+            "n/a"
+            if r.metadata["first_divergence"] is None
+            else str(r.metadata["first_divergence"]),
+            str(r.metadata["token_hash"])[:12],
+        )
+    console.print(table)
+    if jsonl:
+        write_jsonl(jsonl, [r.to_record() for r in results])
 
 
 @app.command("mac-compare")

@@ -1,0 +1,1 @@
+{"prompt":"Add type hints and preserve behavior:\n\ndef double(x):\n    return x + x\n","completion":"def double(x: int) -> int:\n    return x + x\n"}

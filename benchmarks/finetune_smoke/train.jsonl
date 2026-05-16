@@ -1,0 +1,6 @@
+{"prompt":"Rewrite this Python function with type hints and preserve behavior:\n\ndef add(a, b):\n    return a + b\n","completion":"def add(a: int, b: int) -> int:\n    return a + b\n"}
+{"prompt":"Fix the bug and return only Python code:\n\ndef normalize_name(name):\n    return name.strip().lower()\n","completion":"def normalize_name(name: str | None) -> str:\n    if name is None:\n        return \"\"\n    return name.strip().lower()\n"}
+{"prompt":"Add type hints and preserve behavior:\n\ndef is_even(value):\n    return value % 2 == 0\n","completion":"def is_even(value: int) -> bool:\n    return value % 2 == 0\n"}
+{"prompt":"Refactor for clarity and return only code:\n\ndef clamp(x, low, high):\n    if x < low:\n        return low\n    if x > high:\n        return high\n    return x\n","completion":"def clamp(x: float, low: float, high: float) -> float:\n    return max(low, min(x, high))\n"}
+{"prompt":"Add type hints and keep the same output:\n\ndef greet(name):\n    return \"Hello, \" + name\n","completion":"def greet(name: str) -> str:\n    return \"Hello, \" + name\n"}
+{"prompt":"Fix the test failure and return only code:\n\ndef first(items):\n    return items[0]\n","completion":"from collections.abc import Sequence\nfrom typing import TypeVar\n\nT = TypeVar(\"T\")\n\n\ndef first(items: Sequence[T]) -> T:\n    return items[0]\n"}

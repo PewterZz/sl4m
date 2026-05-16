@@ -9,7 +9,11 @@ from sl4m.mac_efficiency import (
     compare_mlx_lm_vs_slam,
     collect_mac_profile,
     detect_apple_chip_generation,
+    first_token_divergence,
+    run_determinism_bench,
+    run_kv_cache_bench,
     summarize_by_best,
+    token_sequence_hash,
     write_jsonl,
 )
 from sl4m.metal_kernels import FUSED_SILU_MUL_SOURCE
@@ -146,6 +150,80 @@ def test_compare_mlx_lm_vs_slam_records_divergence(monkeypatch) -> None:
 
     assert results[0].metadata["token_identity"] is False
     assert results[0].metadata["token_prefix_match"] == 1
+
+
+def test_token_divergence_helpers_are_stable() -> None:
+    assert first_token_divergence([1, 2, 3], [1, 2, 3]) is None
+    assert first_token_divergence([1, 2, 3], [1, 9, 3]) == 1
+    assert first_token_divergence([1, 2, 3], [1, 2]) == 2
+    assert token_sequence_hash([1, 2, 3]) == token_sequence_hash([1, 2, 3])
+
+
+def test_run_determinism_bench_records_repeat_drift(monkeypatch) -> None:
+    calls = {"baseline": 0, "pld": 0}
+
+    def measure(name, model, prompt, fn, *, max_tokens, temperature, top_p, headroom_gb):
+        calls[name] += 1
+        tokens = [1, 2, 3] if name == "baseline" or calls[name] == 1 else [1, 9, 3]
+        return (
+            BenchmarkResult(
+                name=name,
+                model=model,
+                prompt_chars=len(prompt),
+                tokens=len(tokens),
+                seconds=1.0,
+                tok_s=float(len(tokens)),
+            ),
+            tokens,
+            "".join(str(t) for t in tokens),
+        )
+
+    monkeypatch.setattr("sl4m.mac_efficiency._measure_generation_with_tokens", measure)
+
+    results = run_determinism_bench(
+        model="m",
+        prompt="p",
+        modes=["baseline", "pld"],
+        max_tokens=3,
+        temperature=0.0,
+        repeats=2,
+        headroom_gb=4.0,
+    )
+
+    baseline = [r for r in results if r.name == "baseline"]
+    pld = [r for r in results if r.name == "pld"]
+    assert all(r.metadata["matches_first"] for r in baseline)
+    assert pld[0].metadata["matches_first"] is True
+    assert pld[1].metadata["matches_first"] is False
+    assert pld[1].metadata["first_divergence"] == 1
+
+
+def test_run_kv_cache_bench_records_modes(monkeypatch) -> None:
+    def measure(name, model, prompt, fn, *, max_tokens, temperature, headroom_gb):
+        return BenchmarkResult(
+            name=name,
+            model=model,
+            prompt_chars=len(prompt),
+            tokens=max_tokens,
+            seconds=1.0,
+            tok_s=float(max_tokens),
+            peak_mem_gb=1.0,
+        )
+
+    monkeypatch.setattr("sl4m.mac_efficiency._measure_generation", measure)
+
+    results = run_kv_cache_bench(
+        model="m",
+        prompt="p",
+        kv_bits=[None, 8, 4],
+        max_tokens=3,
+        temperature=0.0,
+        repeats=1,
+        headroom_gb=4.0,
+    )
+
+    assert [r.name for r in results] == ["kv-fp", "kv-8bit", "kv-4bit"]
+    assert [r.metadata["kv_bits"] for r in results] == [None, 8, 4]
 
 
 def test_fused_silu_mul_kernel_source_contains_bounds_and_fusion() -> None:

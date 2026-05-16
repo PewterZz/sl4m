@@ -1,0 +1,2 @@
+{"prompt":"Add type hints and preserve behavior:\n\ndef square(x):\n    return x * x\n","completion":"def square(x: int) -> int:\n    return x * x\n"}
+{"prompt":"Fix the bug and return only Python code:\n\ndef safe_len(value):\n    return len(value)\n","completion":"def safe_len(value: object | None) -> int:\n    if value is None:\n        return 0\n    return len(value)\n"}
