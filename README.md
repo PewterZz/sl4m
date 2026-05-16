@@ -99,6 +99,26 @@ This is a pipeline smoke test, not a quality recipe. On the local OmniCoder 9B
 4-bit model, the 2-iteration run trained 0.639M parameters, reached 13.955
 tokens/s, peaked at 6.148 GB, and saved a 2.4 MB adapter.
 
+For harder adapter sweeps, use `mlx-adapter-bench`:
+
+```bash
+slam mlx-adapter-bench \
+  --model ~/Tools/models/Huihui-OmniCoder-9B-abliterated-4bit \
+  --data benchmarks/finetune_smoke \
+  --output-dir runs/adapter-bench/omnicoder-9b-smoke \
+  --fine-tune-types lora,dora \
+  --layers 1,2,4 \
+  --iters 2 \
+  --batch-size 1 \
+  --val-batches 1 \
+  --test-batches 1 \
+  --jsonl runs/adapter-bench-omnicoder-9b-smoke.jsonl
+```
+
+Initial 9B smoke matrix: LoRA-4 gave the best test loss (`1.968`) at 6.879 GB
+peak memory and 10.3 MB adapter size. DoRA-4 was similar quality (`1.972`) but
+used 11.602 GB peak memory, so LoRA is the current default for Mac sweeps.
+
 Don't know which draft pair works for your target? `slam spec-sweep` tries
 `num_draft ∈ {1,2,4,6,8}` and prints a ranked table.
 
@@ -158,6 +178,7 @@ New Mac/MLX training surface:
 - `slam mlx-check-data` — validates MLX-LM JSONL datasets before training/eval
 - `slam mlx-train-plan` — estimates effective batch, steps/epoch, rough token volume, trainable layers, and local model config
 - `slam mlx-train` — LoRA/QLoRA/DoRA/full fine-tuning wrapper with Mac-safe defaults
+- `slam mlx-adapter-bench` — runs LoRA/DoRA/layer-count sweeps and writes train/eval JSONL
 - `slam mlx-eval` — adapter perplexity eval through MLX-LM
 - `slam mlx-fuse` — fuse adapters into standalone MLX models
 - `slam mlx-serve` — OpenAI-compatible local serving through `mlx_lm.server`
@@ -187,6 +208,11 @@ RMSNorm fusion:
 ```bash
 slam mac-norm-bench --rows 256 --hidden 4096 --repeats 50
 ```
+
+2026 KV-cache compression work such as TurboQuant belongs on the inference
+track, not the adapter-training track. The practical sl4m next step is a
+TurboQuant-inspired KV harness for long-context agent cache memory and quality
+before attempting custom Metal cache kernels.
 
 Real-model smoke tests are opt-in so normal CI does not download weights:
 

@@ -89,6 +89,49 @@ same settings through `slam mlx-train`. Next training work should log tokens/s,
 loss, memory peaks, adapter size, and eval perplexity into the same JSONL style
 used by inference benchmarks.
 
+Adapter sweeps are now captured by `mlx-adapter-bench`:
+
+```bash
+slam mlx-adapter-bench \
+  --model ~/Tools/models/Huihui-OmniCoder-9B-abliterated-4bit \
+  --data benchmarks/finetune_smoke \
+  --fine-tune-types lora,dora \
+  --layers 1,2,4 \
+  --iters 2 \
+  --batch-size 1 \
+  --val-batches 1 \
+  --test-batches 1 \
+  --jsonl runs/adapter-bench-omnicoder-9b-smoke.jsonl
+```
+
+Smoke matrix on OmniCoder 9B 4-bit:
+
+| adapter | layers | test loss | tok/s | peak GB | adapter MB |
+|---|---:|---:|---:|---:|---:|
+| LoRA | 1 | 2.045 | 24.76 | 6.148 | 2.44 |
+| LoRA | 2 | 2.025 | 13.52 | 6.549 | 5.07 |
+| LoRA | 4 | **1.968** | 18.87 | 6.879 | 10.33 |
+| DoRA | 1 | 2.044 | 17.14 | 7.624 | 2.60 |
+| DoRA | 2 | 2.028 | 14.73 | 8.989 | 5.41 |
+| DoRA | 4 | 1.972 | 13.23 | 11.602 | 11.01 |
+
+This dataset is intentionally too small for quality claims. The actionable
+systems result is that DoRA works on Mac/MLX but has a steep unified-memory
+cost; LoRA-4 is the current default for larger local sweeps.
+
+## 2026 KV Direction
+
+TurboQuant is relevant for long-context inference, not adapter training. Its
+claim is training-free KV-cache compression through random rotation plus
+coordinate quantization, with reported quality neutrality around 3.5 bits per
+channel and marginal degradation around 2.5 bits per channel. For sl4m, the
+right next step is a Mac KV harness:
+
+1. measure MLX FP16/BF16 KV memory and correctness over long-context agent tasks
+2. compare MLX built-in `--kv-bits 4/8` against baseline output identity and perplexity
+3. prototype TurboQuant-style rotated KV packing/unpacking in MLX arrays
+4. only then move the hot path into custom Metal kernels
+
 ## Generation Benchmarks
 
 Run comparable sl4m generation modes:

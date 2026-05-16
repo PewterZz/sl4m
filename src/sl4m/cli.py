@@ -44,6 +44,7 @@ from .mlx_workflow import (
     TrainRecipe,
     WorkflowError,
     ensure_macos,
+    run_adapter_bench,
     run_command,
     validate_dataset_dir,
 )
@@ -407,6 +408,80 @@ def mlx_eval(
     except WorkflowError as e:
         raise typer.BadParameter(str(e)) from e
     raise typer.Exit(run_command(cfg.to_command(), dry_run=dry_run))
+
+
+@app.command("mlx-adapter-bench")
+def mlx_adapter_bench(
+    model: str = typer.Option(..., help="HF repo id or local MLX model path"),
+    data: str = typer.Option(..., help="Dataset directory with train/valid/test JSONL"),
+    output_dir: str = typer.Option("runs/adapter-bench"),
+    fine_tune_types: str = typer.Option("lora,dora", help="Comma-separated: lora,dora,full"),
+    layers: str = typer.Option("1,2", help="Comma-separated layer counts, e.g. 1,2,4"),
+    iters: int = typer.Option(2),
+    batch_size: int = typer.Option(1),
+    grad_accumulation_steps: int = typer.Option(1),
+    learning_rate: float = typer.Option(1e-5),
+    optimizer: Optional[str] = typer.Option(None),
+    val_batches: int = typer.Option(1),
+    test_batches: int = typer.Option(1),
+    max_seq_length: Optional[int] = typer.Option(None),
+    seed: Optional[int] = typer.Option(0),
+    jsonl: Optional[str] = typer.Option(None, help="Write benchmark records as JSONL"),
+):
+    """Run a small LoRA/DoRA adapter matrix and log train/eval metrics."""
+    try:
+        ensure_macos()
+        selected_types = [x.strip() for x in fine_tune_types.split(",") if x.strip()]
+        selected_layers = [int(x.strip()) for x in layers.split(",") if x.strip()]
+        results = run_adapter_bench(
+            model=model,
+            data=Path(data),
+            output_dir=Path(output_dir),
+            fine_tune_types=selected_types,
+            num_layers=selected_layers,
+            iters=iters,
+            batch_size=batch_size,
+            grad_accumulation_steps=grad_accumulation_steps,
+            learning_rate=learning_rate,
+            optimizer=optimizer,
+            val_batches=val_batches,
+            test_batches=test_batches,
+            max_seq_length=max_seq_length,
+            seed=seed,
+        )
+    except ValueError as e:
+        raise typer.BadParameter(str(e)) from e
+    except WorkflowError as e:
+        raise typer.BadParameter(str(e)) from e
+
+    table = Table(title="MLX adapter benchmark")
+    for col in (
+        "name",
+        "rc",
+        "eval",
+        "train loss",
+        "val loss",
+        "test loss",
+        "tok/s",
+        "peak GB",
+        "adapter MB",
+    ):
+        table.add_column(col, justify="right" if col != "name" else "left")
+    for result in results:
+        table.add_row(
+            result.name,
+            str(result.train_returncode),
+            "n/a" if result.eval_returncode is None else str(result.eval_returncode),
+            "n/a" if result.train_loss is None else f"{result.train_loss:.3f}",
+            "n/a" if result.val_loss is None else f"{result.val_loss:.3f}",
+            "n/a" if result.test_loss is None else f"{result.test_loss:.3f}",
+            "n/a" if result.tokens_per_sec is None else f"{result.tokens_per_sec:.2f}",
+            "n/a" if result.peak_mem_gb is None else f"{result.peak_mem_gb:.2f}",
+            "n/a" if result.adapter_size_mb is None else f"{result.adapter_size_mb:.2f}",
+        )
+    console.print(table)
+    if jsonl:
+        write_jsonl(jsonl, [r.to_record() for r in results])
 
 
 @app.command("mlx-fuse")
