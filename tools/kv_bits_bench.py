@@ -11,9 +11,9 @@ import time
 
 import mlx.core as mx
 
-from slim_ml.backend import GenerationSettings, MLXBackend
-from slim_ml.budget import StaticBudget, auto_detect_limits
-from slim_ml.runtime import Session
+from sl4m.backend import GenerationSettings, MLXBackend
+from sl4m.budget import StaticBudget, auto_detect_limits
+from sl4m.runtime import Session
 
 
 def run(session, prompt, max_tokens, kv_bits=None, kv_start=0):

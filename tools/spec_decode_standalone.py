@@ -1,6 +1,6 @@
-"""Standalone test for slim_ml.spec_decode.speculative_step.
+"""Standalone test for sl4m.spec_decode.speculative_step.
 
-Verifies the slim-ml-native spec decode loop against two gates:
+Verifies the slam-native spec decode loop against two gates:
   1. Correctness: temp=0 token IDs match mlx_lm.stream_generate baseline
   2. Perf: hybrid-attention model reaches ~1.15x speedup and ~55% accept
 
@@ -16,7 +16,7 @@ import mlx.core as mx
 from mlx_lm import load, stream_generate
 from mlx_lm.sample_utils import make_sampler
 
-from slim_ml.spec_decode import speculative_step
+from sl4m.spec_decode import speculative_step
 
 
 def _baseline_tokens(model, tok, prompt: str, max_tokens: int):

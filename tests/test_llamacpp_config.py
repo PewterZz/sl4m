@@ -1,7 +1,7 @@
 """Smoke tests for the Linux/CUDA autoconfig scaffold.
 
 These are pure unit tests — they don't launch llama-server. Real
-end-to-end validation lives in `slim-ml lc-sweep` (run manually).
+end-to-end validation lives in `slam lc-sweep` (run manually).
 """
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from slim_ml.llamacpp_config import (
+from sl4m.llamacpp_config import (
     GGUFInfo,
     ServerConfig,
     _GGUF_TYPE_STRING,

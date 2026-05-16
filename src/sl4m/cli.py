@@ -2,15 +2,43 @@ from __future__ import annotations
 
 import sys
 import time
+from pathlib import Path
 from typing import Optional
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
+from .agent import route_agent_prompt
 from .backend import GenerationSettings, LlamaCppBackend, MLXBackend
 from .budget import StaticBudget, Tier, auto_detect_limits
+from .kernel_harness import (
+    default_linear_shapes,
+    kernel_capabilities,
+    parse_linear_shapes,
+    run_linear_kernel_bench,
+)
+from .mac_efficiency import (
+    build_mac_acceleration_plan,
+    collect_mac_profile,
+    compare_mlx_lm_vs_slam,
+    run_fused_silu_mul_bench,
+    run_mlx_generation_bench,
+    run_rms_norm_bench,
+    summarize_by_best,
+    write_jsonl,
+)
 from .model import ARCH_REGISTRY
+from .mlx_workflow import (
+    EvalRecipe,
+    FuseRecipe,
+    ServeRecipe,
+    TrainRecipe,
+    WorkflowError,
+    ensure_macos,
+    run_command,
+    validate_dataset_dir,
+)
 from .runtime import Session
 from .telemetry import JsonlRecorder, NullRecorder
 
@@ -46,7 +74,7 @@ def run(
     headroom_gb: float = typer.Option(4.0),
     log: Optional[str] = typer.Option(None, help="Path to jsonl telemetry log"),
 ):
-    """Run a model end-to-end through the slim-ml runtime."""
+    """Run a model end-to-end through the slam runtime."""
     spec = ARCH_REGISTRY.get(arch) if arch else None
 
     if backend == "auto":
@@ -74,6 +102,493 @@ def run(
         console.print()
     finally:
         session.close()
+
+
+@app.command("agent-run")
+def agent_run(
+    model: str = typer.Argument(..., help="HF repo id or local MLX model path"),
+    prompt: str = typer.Option(..., help="Agent task prompt"),
+    mode: str = typer.Option("auto", help="auto | baseline | pld"),
+    max_tokens: int = typer.Option(256),
+    temperature: float = typer.Option(0.0),
+    num_draft: int = typer.Option(4),
+    max_ngram: int = typer.Option(3),
+    min_ngram: int = typer.Option(2),
+    headroom_gb: float = typer.Option(4.0),
+    log: Optional[str] = typer.Option(None, help="Path to jsonl telemetry log"),
+    dry_run: bool = typer.Option(False, help="Print routing decision without loading the model"),
+):
+    """Run an agentic prompt with conservative auto-routing for Mac edit workflows."""
+    route = route_agent_prompt(prompt)
+    selected_mode = route.mode if mode == "auto" else mode
+    if selected_mode not in {"baseline", "pld"}:
+        raise typer.BadParameter("mode must be auto, baseline, or pld")
+
+    console.print(
+        f"[cyan]agent route[/cyan] mode={selected_mode} "
+        f"auto={route.mode} confidence={route.confidence:.2f} reason={route.reason}"
+    )
+    if dry_run:
+        return
+
+    limits = auto_detect_limits(headroom_bytes=int(headroom_gb * 1024**3))
+    budget = StaticBudget(limits)
+    recorder = JsonlRecorder(log) if log else NullRecorder()
+    backend = MLXBackend()
+    backend.load(model, None, budget)
+    session = Session(backend=backend, budget=budget, recorder=recorder)
+    settings = GenerationSettings(max_tokens=max_tokens, temperature=temperature)
+    recorder.record(
+        "agent_route",
+        mode=selected_mode,
+        auto_mode=route.mode,
+        confidence=route.confidence,
+        reason=route.reason,
+        prompt_chars=route.prompt_chars,
+        line_count=route.line_count,
+        code_marker_count=route.code_marker_count,
+        repeated_line_count=route.repeated_line_count,
+    )
+    try:
+        if selected_mode == "pld":
+            stream = session.generate_pld_speculative(
+                prompt,
+                settings,
+                num_draft=num_draft,
+                max_ngram_size=max_ngram,
+                min_ngram_size=min_ngram,
+            )
+        else:
+            stream = session.generate(prompt, settings)
+        for tok in stream:
+            console.print(tok.text, end="")
+        console.print()
+    finally:
+        session.close()
+
+
+@app.command("mlx-check-data")
+def mlx_check_data(
+    data: str = typer.Argument(..., help="Directory with train/valid/test JSONL files"),
+    require_test: bool = typer.Option(False, help="Require test.jsonl instead of train.jsonl"),
+):
+    """Validate a dataset directory before MLX fine-tuning/eval."""
+    try:
+        report = validate_dataset_dir(data, require=("test.jsonl",) if require_test else ("train.jsonl",))
+    except WorkflowError as e:
+        raise typer.BadParameter(str(e)) from e
+
+    table = Table(title=f"Dataset: {report.path}")
+    table.add_column("File")
+    table.add_column("Format")
+    table.add_column("Examples", justify="right")
+    for name in report.files:
+        table.add_row(name, report.formats[name], str(report.examples[name]))
+    console.print(table)
+
+
+@app.command("mlx-train")
+def mlx_train(
+    model: Optional[str] = typer.Option(None, help="HF repo id or local MLX model path"),
+    data: Optional[str] = typer.Option(None, help="Dataset directory with train.jsonl"),
+    adapter_path: str = typer.Option("adapters", help="Where adapter weights are written"),
+    fine_tune_type: str = typer.Option("lora", help="lora | dora | full"),
+    iters: int = typer.Option(600),
+    batch_size: int = typer.Option(1),
+    learning_rate: float = typer.Option(1e-5),
+    num_layers: int = typer.Option(16, help="-1 means all layers"),
+    grad_accumulation_steps: int = typer.Option(1),
+    grad_checkpoint: bool = typer.Option(True, help="Trade compute for lower memory"),
+    mask_prompt: bool = typer.Option(True, help="Train loss on completions only for chat/completion data"),
+    recipe: Optional[str] = typer.Option(None, help="TOML recipe with a [train] table"),
+    dry_run: bool = typer.Option(False, help="Print the mlx_lm.lora command without running it"),
+):
+    """Mac-first LoRA/QLoRA/DoRA fine-tuning via MLX-LM."""
+    try:
+        if not dry_run:
+            ensure_macos()
+        if recipe:
+            cfg = TrainRecipe.from_toml(recipe)
+        else:
+            if not model or not data:
+                raise WorkflowError("provide --model and --data, or --recipe")
+            cfg = TrainRecipe(
+                model=model,
+                data=Path(data),
+                adapter_path=Path(adapter_path),
+                fine_tune_type=fine_tune_type,
+                iters=iters,
+                batch_size=batch_size,
+                learning_rate=learning_rate,
+                num_layers=num_layers,
+                grad_accumulation_steps=grad_accumulation_steps,
+                grad_checkpoint=grad_checkpoint,
+                mask_prompt=mask_prompt,
+            )
+        report = cfg.validate()
+    except WorkflowError as e:
+        raise typer.BadParameter(str(e)) from e
+
+    console.print(
+        f"[cyan]mlx train[/cyan] model={cfg.model} data={report.path} "
+        f"adapter={cfg.adapter_path} type={cfg.fine_tune_type}"
+    )
+    raise typer.Exit(run_command(cfg.to_command(), dry_run=dry_run))
+
+
+@app.command("mlx-eval")
+def mlx_eval(
+    model: str = typer.Option(..., help="HF repo id or local MLX model path"),
+    data: str = typer.Option(..., help="Dataset directory with test.jsonl"),
+    adapter_path: str = typer.Option("adapters"),
+    dry_run: bool = typer.Option(False),
+):
+    """Evaluate adapter perplexity through MLX-LM."""
+    try:
+        if not dry_run:
+            ensure_macos()
+        cfg = EvalRecipe(
+            model=model,
+            data=Path(data),
+            adapter_path=Path(adapter_path),
+        )
+        cfg.validate()
+    except WorkflowError as e:
+        raise typer.BadParameter(str(e)) from e
+    raise typer.Exit(run_command(cfg.to_command(), dry_run=dry_run))
+
+
+@app.command("mlx-fuse")
+def mlx_fuse(
+    model: str = typer.Option(..., help="Base model used for training"),
+    adapter_path: str = typer.Option("adapters"),
+    save_path: str = typer.Option("fused_model"),
+    upload_repo: Optional[str] = typer.Option(None),
+    dry_run: bool = typer.Option(False),
+):
+    """Fuse adapters into a standalone MLX model."""
+    try:
+        if not dry_run:
+            ensure_macos()
+        cfg = FuseRecipe(
+            model=model,
+            adapter_path=Path(adapter_path),
+            save_path=Path(save_path),
+            upload_repo=upload_repo,
+        )
+    except WorkflowError as e:
+        raise typer.BadParameter(str(e)) from e
+    raise typer.Exit(run_command(cfg.to_command(), dry_run=dry_run))
+
+
+@app.command("mlx-serve")
+def mlx_serve(
+    model: str = typer.Option(..., help="HF repo id or local MLX model path"),
+    adapter_path: Optional[str] = typer.Option(None, help="Adapter path to load for requests"),
+    draft_model: Optional[str] = typer.Option(None, help="Optional draft model for mlx_lm.server speculation"),
+    host: str = typer.Option("127.0.0.1"),
+    port: int = typer.Option(8080),
+    dry_run: bool = typer.Option(False),
+):
+    """Start MLX-LM's OpenAI-compatible local server."""
+    try:
+        if not dry_run:
+            ensure_macos()
+        cfg = ServeRecipe(
+            model=model,
+            adapter_path=Path(adapter_path) if adapter_path else None,
+            draft_model=draft_model,
+            host=host,
+            port=port,
+        )
+    except WorkflowError as e:
+        raise typer.BadParameter(str(e)) from e
+    console.print(f"[cyan]serving[/cyan] http://{host}:{port}/v1/chat/completions")
+    raise typer.Exit(run_command(cfg.to_command(), dry_run=dry_run))
+
+
+@app.command("mac-profile")
+def mac_profile(
+    jsonl: Optional[str] = typer.Option(None, help="Write profile as one JSONL record"),
+):
+    """Capture Mac hardware, Python, and MLX runtime metadata."""
+    profile = collect_mac_profile()
+    table = Table(title="Mac profile")
+    table.add_column("Field")
+    table.add_column("Value")
+    table.add_row("system", profile.system)
+    table.add_row("release", profile.release)
+    table.add_row("machine", profile.machine)
+    table.add_row("cpu", profile.cpu)
+    table.add_row("ram_gb", f"{profile.ram_gb:.2f}")
+    table.add_row("python", profile.python)
+    table.add_row(
+        "apple_chip_generation",
+        f"M{profile.apple_chip_generation}" if profile.apple_chip_generation else "unknown",
+    )
+    table.add_row("mlx_version", profile.mlx_version or "not installed")
+    table.add_row("mlx_device", str(profile.mlx_device or {}))
+    console.print(table)
+
+    plan = build_mac_acceleration_plan(profile.apple_chip_generation)
+    plan_table = Table(title="Acceleration plan")
+    plan_table.add_column("Path")
+    plan_table.add_column("Status")
+    plan_table.add_column("Applies to")
+    plan_table.add_column("Guardrail")
+    for opp in plan.opportunities:
+        plan_table.add_row(opp.name, opp.status, opp.applies_to, opp.guardrail)
+    console.print(plan_table)
+    if jsonl:
+        write_jsonl(jsonl, [profile, plan])
+
+
+@app.command("mac-bench")
+def mac_bench(
+    model: str = typer.Argument(..., help="HF repo id or local MLX model path"),
+    prompt: str = typer.Option(
+        "Write a Python function that validates and normalizes a nested JSON config.",
+    ),
+    modes: str = typer.Option("baseline,pld", help="Comma-separated: baseline,pld"),
+    max_tokens: int = typer.Option(128),
+    temperature: float = typer.Option(0.0),
+    repeats: int = typer.Option(1),
+    num_draft: int = typer.Option(4),
+    max_ngram: int = typer.Option(3),
+    min_ngram: int = typer.Option(2),
+    headroom_gb: float = typer.Option(4.0),
+    jsonl: Optional[str] = typer.Option(None, help="Write raw benchmark results"),
+):
+    """Benchmark slam Mac generation modes with comparable settings."""
+    selected = [m.strip() for m in modes.split(",") if m.strip()]
+    results = run_mlx_generation_bench(
+        model=model,
+        prompt=prompt,
+        modes=selected,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        repeats=repeats,
+        headroom_gb=headroom_gb,
+        num_draft=num_draft,
+        max_ngram=max_ngram,
+        min_ngram=min_ngram,
+    )
+    table = Table(title="Mac generation benchmark")
+    for col in ("mode", "tokens", "seconds", "tok/s", "ttft", "peak GB"):
+        table.add_column(col, justify="right" if col != "mode" else "left")
+    for r in results:
+        table.add_row(
+            r.name,
+            str(r.tokens),
+            f"{r.seconds:.2f}",
+            f"{r.tok_s:.2f}",
+            f"{(r.first_token_s or 0.0):.3f}",
+            f"{r.peak_mem_gb:.2f}" if r.peak_mem_gb is not None else "n/a",
+        )
+    console.print(table)
+    best = summarize_by_best(results)
+    if len(best) > 1 and best[0].tok_s > 0:
+        baseline = next((r for r in best if r.name == "baseline"), best[0])
+        for r in best:
+            if r.name != baseline.name and baseline.tok_s > 0:
+                console.print(f"[green]{r.name} vs {baseline.name}: {r.tok_s / baseline.tok_s:.2f}×[/green]")
+    if jsonl:
+        write_jsonl(jsonl, results)
+
+
+@app.command("mac-compare")
+def mac_compare(
+    model: str = typer.Argument(..., help="HF repo id or local MLX model path"),
+    prompt: str = typer.Option("Return exactly: ready"),
+    max_tokens: int = typer.Option(16),
+    temperature: float = typer.Option(0.0),
+    top_p: float = typer.Option(0.95),
+    repeats: int = typer.Option(1),
+    headroom_gb: float = typer.Option(4.0),
+    jsonl: Optional[str] = typer.Option(None),
+):
+    """Compare MLX-LM direct generation against slam baseline generation."""
+    results = compare_mlx_lm_vs_slam(
+        model=model,
+        prompt=prompt,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        repeats=repeats,
+        headroom_gb=headroom_gb,
+    )
+    table = Table(title="MLX-LM direct vs slam")
+    for col in ("path", "tokens", "seconds", "tok/s", "ttft", "peak GB", "identity"):
+        table.add_column(col, justify="right" if col != "path" else "left")
+    for r in results:
+        table.add_row(
+            r.name,
+            str(r.tokens),
+            f"{r.seconds:.2f}",
+            f"{r.tok_s:.2f}",
+            f"{(r.first_token_s or 0.0):.3f}",
+            f"{r.peak_mem_gb:.2f}" if r.peak_mem_gb is not None else "n/a",
+            "yes" if r.metadata.get("token_identity") else "no",
+        )
+    console.print(table)
+    for i in range(0, len(results), 2):
+        direct = results[i]
+        slam_result = results[i + 1] if i + 1 < len(results) else None
+        if slam_result and direct.tok_s > 0:
+            console.print(
+                f"[green]repeat {direct.metadata.get('repeat')}: "
+                f"slam/direct={slam_result.tok_s / direct.tok_s:.2f}×[/green]"
+            )
+    if jsonl:
+        write_jsonl(jsonl, [r.to_record() for r in results])
+
+
+@app.command("mac-kernel-bench")
+def mac_kernel_bench(
+    size: int = typer.Option(16_777_216, help="Number of elements"),
+    dtype: str = typer.Option("float16", help="float16 | float32"),
+    repeats: int = typer.Option(50),
+    jsonl: Optional[str] = typer.Option(None),
+):
+    """Benchmark custom Metal kernels against MLX reference ops."""
+    results = run_fused_silu_mul_bench(size=size, dtype=dtype, repeats=repeats)
+    table = Table(title="Mac Metal kernel benchmark")
+    table.add_column("kernel")
+    table.add_column("seconds", justify="right")
+    table.add_column("elem/s", justify="right")
+    table.add_column("peak GB", justify="right")
+    for r in results:
+        table.add_row(
+            r.name,
+            f"{r.seconds:.4f}",
+            f"{r.tok_s:.0f}",
+            f"{r.peak_mem_gb:.2f}" if r.peak_mem_gb is not None else "n/a",
+        )
+    console.print(table)
+    ref = next((r for r in results if r.name.startswith("mlx-reference")), None)
+    custom = next((r for r in results if r.name.startswith("slam-metal")), None)
+    if ref and custom and ref.tok_s > 0:
+        console.print(f"[green]custom/ref: {custom.tok_s / ref.tok_s:.2f}×[/green]")
+    if jsonl:
+        write_jsonl(jsonl, results)
+
+
+@app.command("mac-norm-bench")
+def mac_norm_bench(
+    rows: int = typer.Option(256, help="Rows/tokens in the benchmark input"),
+    hidden: int = typer.Option(4096, help="Hidden dimension"),
+    dtype: str = typer.Option("float16", help="float16 | float32"),
+    eps: float = typer.Option(1e-6),
+    repeats: int = typer.Option(50),
+    jsonl: Optional[str] = typer.Option(None),
+):
+    """Benchmark the custom Metal RMSNorm kernel against MLX reference."""
+    results = run_rms_norm_bench(
+        rows=rows,
+        hidden=hidden,
+        dtype=dtype,
+        eps=eps,
+        repeats=repeats,
+    )
+    table = Table(title="Mac RMSNorm kernel benchmark")
+    table.add_column("kernel")
+    table.add_column("shape")
+    table.add_column("seconds", justify="right")
+    table.add_column("elem/s", justify="right")
+    table.add_column("peak GB", justify="right")
+    for r in results:
+        table.add_row(
+            r.name,
+            f"{rows}x{hidden}",
+            f"{r.seconds:.4f}",
+            f"{r.tok_s:.0f}",
+            f"{r.peak_mem_gb:.2f}" if r.peak_mem_gb is not None else "n/a",
+        )
+    console.print(table)
+    ref = next((r for r in results if r.name.startswith("mlx-reference")), None)
+    custom = next((r for r in results if r.name.startswith("slam-metal")), None)
+    if ref and custom and ref.tok_s > 0:
+        console.print(f"[green]custom/ref: {custom.tok_s / ref.tok_s:.2f}×[/green]")
+    if jsonl:
+        write_jsonl(jsonl, results)
+
+
+@app.command("mac-linear-bench")
+def mac_linear_bench(
+    profile: str = typer.Option(
+        "tiny",
+        help="Shape profile: tiny | qwen2_7b | llama3_8b",
+    ),
+    shapes: Optional[str] = typer.Option(
+        None,
+        help="Override shapes as comma-separated MxKxN, e.g. 1x4096x4096,256x4096x14336",
+    ),
+    backends: str = typer.Option(
+        "mlx-matmul,mlx-quantized-roundtrip",
+        help="Comma-separated: mlx-matmul,mlx-quantized-roundtrip",
+    ),
+    dtype: str = typer.Option("float16", help="float16 | float32 | bfloat16"),
+    repeats: int = typer.Option(20),
+    seed: int = typer.Option(0),
+    quant_group_size: int = typer.Option(64),
+    quant_bits: int = typer.Option(4),
+    jsonl: Optional[str] = typer.Option(None),
+):
+    """Run the Mac linear-kernel research harness on transformer shapes."""
+    try:
+        selected_shapes = parse_linear_shapes(shapes) if shapes else default_linear_shapes(profile)
+    except ValueError as e:
+        raise typer.BadParameter(str(e)) from e
+    selected_backends = [b.strip() for b in backends.split(",") if b.strip()]
+
+    cap_table = Table(title="Kernel capabilities")
+    cap_table.add_column("Capability")
+    cap_table.add_column("Available")
+    cap_table.add_column("Reason")
+    for cap in kernel_capabilities():
+        cap_table.add_row(cap.name, "yes" if cap.available else "no", cap.reason)
+    console.print(cap_table)
+
+    results = run_linear_kernel_bench(
+        shapes=selected_shapes,
+        backends=selected_backends,
+        dtype=dtype,
+        repeats=repeats,
+        seed=seed,
+        quant_group_size=quant_group_size,
+        quant_bits=quant_bits,
+    )
+
+    table = Table(title="Linear kernel benchmark")
+    for col in (
+        "shape",
+        "kind",
+        "backend",
+        "dtype",
+        "ms",
+        "TFLOP/s",
+        "peak GB",
+        "allclose",
+        "max err",
+    ):
+        table.add_column(col, justify="right" if col not in {"shape", "backend", "kind", "dtype"} else "left")
+    for r in results:
+        corr = r.correctness
+        table.add_row(
+            f"{r.shape.m}x{r.shape.k}x{r.shape.n}",
+            r.shape.kind,
+            r.backend,
+            r.dtype,
+            f"{r.matmul_s * 1000:.3f}",
+            f"{r.tflops:.2f}",
+            f"{r.peak_mem_gb:.2f}" if r.peak_mem_gb is not None else "n/a",
+            "ref" if corr is None else ("yes" if corr.allclose else "no"),
+            "ref" if corr is None else f"{corr.max_abs_error:.3g}",
+        )
+    console.print(table)
+
+    if jsonl:
+        write_jsonl(jsonl, [r.to_record() for r in results])
 
 
 @app.command()
@@ -169,7 +684,7 @@ def spec(
 ):
     """Speculative decoding with per-round telemetry.
 
-    MLX-only. Handles hybrid-attention models (Qwen3.5 family) via slim-ml's
+    MLX-only. Handles hybrid-attention models (Qwen3.5 family) via sl4m's
     own snapshot/restore of ArraysCache + KVCache state.
     """
     be = MLXBackend()
@@ -518,7 +1033,7 @@ def techniques():
     table.add_row("spec_decode", "v1", "shipped (MLX, hybrid-attention supported)")
     table.add_row("kv_quant", "v2", "runtime knob shipped (--kv-bits); Technique interface TBD")
     table.add_row("layer_stream", "v2", "stub")
-    table.add_row("lc_autoconfig", "linux", "shipped (slim-ml lc-probe / lc-sweep)")
+    table.add_row("lc_autoconfig", "linux", "shipped (slam lc-probe / lc-sweep)")
     console.print(table)
 
 

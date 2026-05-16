@@ -146,9 +146,9 @@ class SpecDecode(Technique):
 
     This is NOT a per-step Technique — spec decode replaces the generation loop
     rather than hooking into it. Use `Session.generate_speculative()` or the
-    `slim-ml spec` CLI command instead of `Session(techniques=[SpecDecode(...)])`.
+    `slam spec` CLI command instead of `Session(techniques=[SpecDecode(...)])`.
 
-    Implementation lives in `slim_ml.spec_decode.speculative_step` — a direct
+    Implementation lives in `sl4m.spec_decode.speculative_step` — a direct
     port of `mlx_lm.generate.speculative_generate_step` extended with the
     ArraysCache snapshot/restore from PR ml-explore/mlx-lm#1111 so hybrid
     linear+full attention models (Qwen3.5 family, OmniCoder) work correctly.
@@ -174,7 +174,7 @@ class SpecDecode(Technique):
     def attach(self, ctx: "RuntimeContext") -> None:
         raise NotImplementedError(
             "SpecDecode is not a per-step Technique. Use "
-            "Session.generate_speculative(...) or the `slim-ml spec` CLI "
+            "Session.generate_speculative(...) or the `slam spec` CLI "
             "command. See class docstring."
         )
 

@@ -1,7 +1,7 @@
 """Unit tests for prompt_lookup_draft."""
 from __future__ import annotations
 
-from slim_ml.prompt_lookup import prompt_lookup_draft
+from sl4m.prompt_lookup import prompt_lookup_draft
 
 
 def test_empty_and_zero_budget():

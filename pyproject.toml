@@ -1,5 +1,5 @@
 [project]
-name = "slim-ml"
+name = "sl4m"
 version = "0.0.1"
 description = "Adaptive LLM runtime for running big models on constrained hardware"
 readme = "README.md"
@@ -27,21 +27,25 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/PewterZz/slim-ml"
-Repository = "https://github.com/PewterZz/slim-ml"
-Issues = "https://github.com/PewterZz/slim-ml/issues"
+Homepage = "https://github.com/PewterZz/sl4m"
+Repository = "https://github.com/PewterZz/sl4m"
+Issues = "https://github.com/PewterZz/sl4m/issues"
 
 [project.optional-dependencies]
 mlx = ["mlx>=0.20", "mlx-lm>=0.20"]
+mac = ["mlx>=0.20", "mlx-lm[train]>=0.20"]
 llama = ["llama-cpp-python>=0.3"]
 dev = ["pytest>=8.0"]
 
 [project.scripts]
-slim-ml = "slim_ml.cli:app"
+slam = "sl4m.cli:app"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/slim_ml"]
+packages = ["src/sl4m"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

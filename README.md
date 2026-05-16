@@ -1,4 +1,4 @@
-# slim-ml
+# sl4m
 
 An adaptive LLM runtime for running big models on constrained hardware.
 
@@ -8,25 +8,58 @@ Targets the cases current tools do poorly:
 
 ## Quickstart
 
-Pick the path that matches your machine. Both use the same `slim-ml` CLI.
+Pick the path that matches your machine. Both use the same `slam` CLI.
 
 ### Mac (MLX)
 
 ```bash
-pip install -e ".[mlx]"
+pip install -e ".[mac]"
 
 # 1. Fastest decoding on coding/edit workloads (no draft model needed)
-slim-ml pld mlx-community/Qwen2.5-Coder-7B-Instruct-4bit
+slam pld mlx-community/Qwen2.5-Coder-7B-Instruct-4bit
 
 # 2. Best speedup if you have a small draft model of the same family
-slim-ml spec mlx-community/Qwen2.5-Coder-7B-Instruct-4bit \
+slam spec mlx-community/Qwen2.5-Coder-7B-Instruct-4bit \
   --draft mlx-community/Qwen2.5-Coder-1.5B-Instruct-4bit
 
 # 3. Plain generation with good defaults
-slim-ml run <mlx-model>
+slam run <mlx-model>
 ```
 
-Don't know which draft pair works for your target? `slim-ml spec-sweep` tries
+Fine-tune and serve on Apple Silicon:
+
+```bash
+# Dataset preflight. train.jsonl is required for training; valid.jsonl is optional.
+slam mlx-check-data data/my-sft
+
+# QLoRA if the base is already quantized, regular LoRA otherwise.
+slam mlx-train \
+  --model mlx-community/Qwen2.5-Coder-7B-Instruct-4bit \
+  --data data/my-sft \
+  --adapter-path adapters/qwen2.5-coder \
+  --iters 600 \
+  --batch-size 1 \
+  --grad-accumulation-steps 4
+
+# Same run from a reproducible recipe.
+slam mlx-train --recipe configs/mac_lora_example.toml
+
+# Evaluate on test.jsonl, then fuse adapters into a standalone MLX model.
+slam mlx-eval --model mlx-community/Qwen2.5-Coder-7B-Instruct-4bit \
+  --data data/my-sft --adapter-path adapters/qwen2.5-coder
+slam mlx-fuse --model mlx-community/Qwen2.5-Coder-7B-Instruct-4bit \
+  --adapter-path adapters/qwen2.5-coder --save-path fused/qwen2.5-coder
+
+# OpenAI-compatible local serving.
+slam mlx-serve --model mlx-community/Qwen2.5-Coder-7B-Instruct-4bit \
+  --adapter-path adapters/qwen2.5-coder --port 8080
+```
+
+MLX-LM accepts local JSONL datasets in `chat`, `tools`, `completions`, or
+`text` format. `slam mlx-check-data` validates the split files before a
+long Mac training run starts.
+
+Don't know which draft pair works for your target? `slam spec-sweep` tries
 `num_draft ∈ {1,2,4,6,8}` and prints a ranked table.
 
 ### Linux + NVIDIA GPU (llama.cpp)
@@ -36,11 +69,11 @@ pip install -e ".[llama]"
 
 # Find the highest-tps llama-server config that fits your GPU.
 # Prints a ready-to-paste llama-server command with the winning settings.
-slim-ml lc-sweep models/YOUR_MODEL.gguf \
+slam lc-sweep models/YOUR_MODEL.gguf \
   --server-bin ./build-linux/bin/llama-server
 
 # Dry-run: inspect candidate configs without launching anything.
-slim-ml lc-probe models/YOUR_MODEL.gguf
+slam lc-probe models/YOUR_MODEL.gguf
 ```
 
 Measured wins on a RTX 3060 Laptop 6 GB: **+35%** on OmniCoder 9B (24 → 32.3 t/s),
@@ -69,26 +102,84 @@ A scheduling/orchestration layer on top of proven kernels (MLX on Mac, llama.cpp
 ## Status
 
 Early scaffold. What works end-to-end today:
-- `slim-ml probe` — system probe
-- `slim-ml run MODEL` — MLX backend generation with t/s telemetry (OmniCoder 9B etc.)
-- `slim-ml bench MODEL` — prompt cache reuse benchmark (~6.4× TTFT on turn 2)
-- `slim-ml spec MODEL --draft DRAFT` — speculative decoding with correctness gate and per-round telemetry
-- `slim-ml pld MODEL` — draftless Prompt Lookup Decoding (n-gram match against context) with correctness gate
-- `slim-ml hybrid MODEL --draft DRAFT` — PLD first, draft model on no-match fallback (investigated; see results below)
+- `slam probe` — system probe
+- `slam run MODEL` — MLX backend generation with t/s telemetry (OmniCoder 9B etc.)
+- `slam bench MODEL` — prompt cache reuse benchmark (~6.4× TTFT on turn 2)
+- `slam spec MODEL --draft DRAFT` — speculative decoding with correctness gate and per-round telemetry
+- `slam pld MODEL` — draftless Prompt Lookup Decoding (n-gram match against context) with correctness gate
+- `slam hybrid MODEL --draft DRAFT` — PLD first, draft model on no-match fallback (investigated; see results below)
 
 What's interface-only (NotImplementedError):
 - Expert caching migration (hot-set selection + tier moves; observation hook below is shipped)
 - KV quantization Technique (runtime knob shipped as `--kv-bits`), layer streaming
 
+New Mac/MLX training surface:
+- `slam mlx-check-data` — validates MLX-LM JSONL datasets before training/eval
+- `slam mlx-train` — LoRA/QLoRA/DoRA/full fine-tuning wrapper with Mac-safe defaults
+- `slam mlx-eval` — adapter perplexity eval through MLX-LM
+- `slam mlx-fuse` — fuse adapters into standalone MLX models
+- `slam mlx-serve` — OpenAI-compatible local serving through `mlx_lm.server`
+- `slam mac-profile` — captures Mac/MLX runtime metadata for benchmark runs
+- `slam mac-bench` — compares slam Mac generation modes with JSONL output
+- `slam mac-kernel-bench` — benchmarks custom Metal kernels vs MLX reference ops
+
+Mac efficiency work lives in [docs/mac-efficiency-roadmap.md](docs/mac-efficiency-roadmap.md).
+Notes from Cider's M5 INT8 TensorOps and ANE experiments are in
+[docs/cider-lessons.md](docs/cider-lessons.md).
+The first custom kernel target is fused `silu(a) * b`, a gated-MLP hot path:
+
+```bash
+slam mac-kernel-bench --size 16777216 --dtype float16 --repeats 50
+```
+
+For linear-layer research, use the shape harness before writing kernels:
+
+```bash
+slam mac-linear-bench --profile tiny --repeats 20
+slam mac-linear-bench --shapes 1x4096x4096,256x4096x14336 --repeats 10
+```
+
+For the first row-wise reduction candidate:
+
+```bash
+slam mac-norm-bench --rows 256 --hidden 4096 --repeats 50
+```
+
+Real-model smoke tests are opt-in so normal CI does not download weights:
+
+```bash
+SL4M_REAL_MODEL=mlx-community/Qwen2.5-0.5B-Instruct-4bit pytest -q tests/test_real_models_optional.py
+```
+
+Compare MLX-LM direct against the `slam` baseline on a local model:
+
+```bash
+slam mac-compare ~/Tools/models/Huihui-OmniCoder-9B-abliterated-4bit \
+  --max-tokens 16 \
+  --temperature 0.0 \
+  --jsonl runs/omnicoder-9b-direct-vs-slam.jsonl
+```
+
+For coding-agent tasks, `agent-run` routes edit-shaped prompts to PLD and keeps
+open-ended prompts on baseline:
+
+```bash
+slam agent-run ~/Tools/models/Huihui-OmniCoder-9B-abliterated-4bit \
+  --prompt "$(cat tests/test_kernel_harness.py)
+
+Refactor the code above for clarity. Preserve behavior and return only updated code." \
+  --max-tokens 256
+```
+
 ## Speculative decoding
 
 A small draft model proposes N tokens; the target model verifies them in one
 batched forward pass and accepts the prefix that matches. Works on hybrid
-linear+full-attention models (Qwen3.5 family, OmniCoder) via slim-ml's own
+linear+full-attention models (Qwen3.5 family, OmniCoder) via sl4m's own
 `ArraysCache`+`KVCache` snapshot/restore — no mlx-lm fork required.
 
 ```bash
-slim-ml spec NexVeridian/OmniCoder-9B-4bit \
+slam spec NexVeridian/OmniCoder-9B-4bit \
   --draft mlx-community/Qwen3.5-0.8B-MLX-4bit \
   --num-draft 2 \
   --max-tokens 96 \
@@ -107,14 +198,14 @@ Measured on M3 Air 16GB (April 2026, temp=0):
 | OmniCoder 9B 4bit (hybrid) | Qwen3.5-0.8B 4bit | 4 | 0.62× | 46.9% |
 | Qwen2.5-Coder-7B 4bit | Qwen2.5-Coder-1.5B 4bit | 2 | 1.55× | 62.5% |
 
-Use `slim-ml spec-sweep` to pick the best `num_draft` for your pair — on
+Use `slam spec-sweep` to pick the best `num_draft` for your pair — on
 OmniCoder `num_draft=1` wins because drafts cost less to run and rejections
 carry a heavy replay tax (24/32 layers are linear-attention and replay
 sequentially). The hybrid ceiling (~1.4× at best) stays below the pure-KV
 ceiling (1.55×+) for that same reason.
 
 ```bash
-slim-ml spec-sweep NexVeridian/OmniCoder-9B-4bit \
+slam spec-sweep NexVeridian/OmniCoder-9B-4bit \
   --draft mlx-community/Qwen3.5-0.8B-MLX-4bit \
   --num-drafts "1,2,4"
 ```
@@ -122,9 +213,9 @@ slim-ml spec-sweep NexVeridian/OmniCoder-9B-4bit \
 Programmatic use:
 
 ```python
-from slim_ml.backend import GenerationSettings, MLXBackend
-from slim_ml.budget import StaticBudget, auto_detect_limits
-from slim_ml.runtime import Session
+from sl4m.backend import GenerationSettings, MLXBackend
+from sl4m.budget import StaticBudget, auto_detect_limits
+from sl4m.runtime import Session
 
 be = MLXBackend()
 be.load("NexVeridian/OmniCoder-9B-4bit", None, StaticBudget(auto_detect_limits()))
@@ -152,7 +243,7 @@ repetition (field names, repeated method structure, refactors) — exactly
 the shape of most coding and editing workloads.
 
 ```bash
-slim-ml pld mlx-community/Qwen2.5-Coder-7B-Instruct-4bit \
+slam pld mlx-community/Qwen2.5-Coder-7B-Instruct-4bit \
   --prompt "Implement to_dict, from_dict, __repr__, __eq__ for this dataclass..." \
   --num-draft 8 \
   --max-tokens 192 \
@@ -196,7 +287,7 @@ speedup flips sign. On a laptop with browser/other apps running, PLD may
 perform worse than baseline. The 1.38× and 1.60× numbers are clean-room
 upper bounds, not floors.
 
-The implementation (`src/slim_ml/prompt_lookup.py` + `speculative_step_pld`
+The implementation (`src/sl4m/prompt_lookup.py` + `speculative_step_pld`
 in `spec_decode.py`) shares the same snapshot/restore machinery as the
 draft-model path, so it works on hybrid-attention models too.
 
@@ -208,7 +299,7 @@ a draft model on no-match, should fill that bottleneck using the same
 verifier — expected aggregate 1.5-1.8×.
 
 ```bash
-slim-ml hybrid mlx-community/Qwen2.5-Coder-7B-Instruct-4bit \
+slam hybrid mlx-community/Qwen2.5-Coder-7B-Instruct-4bit \
   --draft mlx-community/Qwen2.5-Coder-1.5B-Instruct-4bit \
   --num-draft 8 --max-tokens 192 --temperature 0.0
 ```
@@ -247,7 +338,7 @@ reproducible. Do not reach for it; reach for `pld` (no draft model) or
 
 ## KV cache quantization
 
-`slim-ml run --kv-bits {4,8}` wires mlx-lm's quantized KV cache through
+`slam run --kv-bits {4,8}` wires mlx-lm's quantized KV cache through
 `GenerationSettings`. Use `--kv-start N` to keep the first N decoded steps
 FP16 before quantizing (reduces early-token drift).
 
@@ -356,10 +447,10 @@ into probe-and-measure.
 
 ```bash
 # 1. Inspect a GGUF and see what configs would fit in VRAM
-slim-ml lc-probe models/OmniCoder-9B-Q4_K_M.gguf --ctx-target 32000
+slam lc-probe models/OmniCoder-9B-Q4_K_M.gguf --ctx-target 32000
 
 # 2. Actually launch each candidate, time 96 tokens, kill, report
-slim-ml lc-sweep models/OmniCoder-9B-Q4_K_M.gguf \
+slam lc-sweep models/OmniCoder-9B-Q4_K_M.gguf \
   --server-bin ./build-linux/bin/llama-server \
   --ctx-target 32000 --max-configs 6 \
   --log-dir /tmp/sweep-logs
@@ -450,7 +541,7 @@ pip install -e ".[mlx,llama,dev]" # both + tests
   VRAM pool. A future `Tier.UNIFIED` (or platform-aware mapping in `StaticBudget`)
   will address this. Until then, configure budgets manually on Mac.
 - **End-to-end MLX path is written but unverified on a real model.** CLI and
-  modules import cleanly; `slim-ml run <mlx-model>` has not been executed against
+  modules import cleanly; `slam run <mlx-model>` has not been executed against
   a live mlx-lm install yet — first-run may surface API signature mismatches.
 - **Expert cache + all other techniques raise `NotImplementedError` on attach.**
   The scaffold defines the interfaces; the implementations are the roadmap.

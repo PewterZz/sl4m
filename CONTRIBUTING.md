@@ -1,6 +1,6 @@
-# Contributing to slim-ml
+# Contributing to sl4m
 
-Thanks for your interest. slim-ml is an adaptive LLM runtime focused on running
+Thanks for your interest. sl4m is an adaptive LLM runtime focused on running
 big models on constrained hardware. It's early-stage scaffold — contributions
 that move one of the roadmap items from `NotImplementedError` to "works and
 measured" are the most valuable.
@@ -10,7 +10,7 @@ measured" are the most valuable.
 See `README.md` for current status. In order:
 
 1. **Routing hooks in `MLXBackend`** — unblocks `tools/routing_probe.py`
-2. **Expert cache migration logic** — `src/slim_ml/technique.py::ExpertCache`
+2. **Expert cache migration logic** — `src/sl4m/technique.py::ExpertCache`
 3. **`Tier.UNIFIED`** for Apple Silicon — replaces `Tier.VRAM=0` hack
 4. **Speculative decoding, KV quantization, layer streaming** — interface stubs
 
@@ -20,8 +20,8 @@ can discuss fit.
 ## Development setup
 
 ```bash
-git clone https://github.com/PewterZz/slim-ml.git
-cd slim-ml
+git clone https://github.com/PewterZz/sl4m.git
+cd slam
 pip install -e ".[mlx,llama,dev]"   # or drop mlx/llama based on your platform
 pytest
 ```
@@ -42,7 +42,7 @@ Include:
 - Hardware (VRAM, RAM, model/arch of your laptop or Mac)
 - Model you were running
 - Full traceback
-- Output of `slim-ml probe`
+- Output of `slam probe`
 
 ## Pull requests
 

@@ -1,4 +1,4 @@
-from slim_ml.budget import StaticBudget, Tier
+from sl4m.budget import StaticBudget, Tier
 
 
 def test_reserve_within_capacity():
