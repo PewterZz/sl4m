@@ -40,6 +40,7 @@ from .mlx_workflow import (
     EvalRecipe,
     FuseRecipe,
     ServeRecipe,
+    TrainPlan,
     TrainRecipe,
     WorkflowError,
     ensure_macos,
@@ -317,6 +318,69 @@ def mlx_train(
         f"adapter={cfg.adapter_path} type={cfg.fine_tune_type}"
     )
     raise typer.Exit(run_command(cfg.to_command(), dry_run=dry_run))
+
+
+def _render_train_plan(plan: TrainPlan) -> None:
+    table = Table(title="MLX training plan")
+    table.add_column("Field")
+    table.add_column("Value")
+    cfg = plan.model_config
+    table.add_row("model", plan.recipe.model)
+    table.add_row("model_type", cfg.model_type or "unknown")
+    table.add_row("hidden", str(cfg.hidden_size or "unknown"))
+    table.add_row("layers", str(cfg.num_hidden_layers or "unknown"))
+    table.add_row("heads", str(cfg.num_attention_heads or "unknown"))
+    table.add_row("quant_bits", str(cfg.quantization_bits or "unknown"))
+    table.add_row("data", str(plan.dataset.path))
+    table.add_row("train_examples", str(plan.dataset.train_examples))
+    table.add_row("rough_train_tokens", str(plan.dataset.rough_train_tokens))
+    table.add_row("effective_batch", str(plan.effective_batch_size))
+    table.add_row("steps_per_epoch", str(plan.optimizer_steps_per_epoch))
+    table.add_row("iters", str(plan.recipe.iters))
+    table.add_row("estimated_epochs", f"{plan.estimated_epochs:.2f}")
+    table.add_row("trainable_layers", str(plan.trainable_layer_count or "unknown"))
+    table.add_row("rough_tokens_per_step", str(plan.rough_tokens_per_step))
+    console.print(table)
+
+
+@app.command("mlx-train-plan")
+def mlx_train_plan(
+    model: Optional[str] = typer.Option(None, help="HF repo id or local MLX model path"),
+    data: Optional[str] = typer.Option(None, help="Dataset directory with train.jsonl"),
+    adapter_path: str = typer.Option("adapters", help="Where adapter weights are written"),
+    fine_tune_type: str = typer.Option("lora", help="lora | dora | full"),
+    iters: int = typer.Option(600),
+    batch_size: int = typer.Option(1),
+    learning_rate: float = typer.Option(1e-5),
+    num_layers: int = typer.Option(16, help="-1 means all layers"),
+    grad_accumulation_steps: int = typer.Option(1),
+    grad_checkpoint: bool = typer.Option(True),
+    mask_prompt: bool = typer.Option(True),
+    recipe: Optional[str] = typer.Option(None, help="TOML recipe with a [train] table"),
+):
+    """Estimate Mac MLX fine-tuning shape before launching a long run."""
+    try:
+        if recipe:
+            cfg = TrainRecipe.from_toml(recipe)
+        else:
+            if not model or not data:
+                raise WorkflowError("provide --model and --data, or --recipe")
+            cfg = TrainRecipe(
+                model=model,
+                data=Path(data),
+                adapter_path=Path(adapter_path),
+                fine_tune_type=fine_tune_type,
+                iters=iters,
+                batch_size=batch_size,
+                learning_rate=learning_rate,
+                num_layers=num_layers,
+                grad_accumulation_steps=grad_accumulation_steps,
+                grad_checkpoint=grad_checkpoint,
+                mask_prompt=mask_prompt,
+            )
+        _render_train_plan(cfg.plan())
+    except WorkflowError as e:
+        raise typer.BadParameter(str(e)) from e
 
 
 @app.command("mlx-eval")

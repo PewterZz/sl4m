@@ -59,9 +59,35 @@ slam mac-norm-bench --rows 256 --hidden 4096 --repeats 50 \
   --jsonl runs/rms_norm.jsonl
 ```
 
+The same benchmark now includes `residual_rms_norm`, which fuses residual add
+and RMSNorm into one Metal pass. This is a better transformer-block candidate
+than standalone RMSNorm because agent decode repeatedly pays memory bandwidth
+for residual reads/writes around normalization.
+
 Small shapes are useful for correctness and compiler smoke tests only. Treat
 performance claims as meaningful only after running model-representative hidden
 sizes and prefill/decode row counts.
+
+## Fine-Tuning Plan
+
+Training should be measured before launched. The first planning layer validates
+dataset splits, counts rough token volume, reads local `config.json` when present,
+and estimates the effective optimizer schedule:
+
+```bash
+slam mlx-train-plan \
+  --model ~/Tools/models/Huihui-OmniCoder-9B-abliterated-4bit \
+  --data data/my-sft \
+  --batch-size 1 \
+  --grad-accumulation-steps 4 \
+  --num-layers 16 \
+  --iters 600
+```
+
+Use the output to decide whether a Mac run is worth starting, then launch the
+same settings through `slam mlx-train`. Next training work should log tokens/s,
+loss, memory peaks, adapter size, and eval perplexity into the same JSONL style
+used by inference benchmarks.
 
 ## Generation Benchmarks
 

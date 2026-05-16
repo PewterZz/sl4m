@@ -169,3 +169,37 @@ iters = 2
     assert result.exit_code == 0
     assert "mlx_lm.lora" in result.output
     assert "--adapter-path" in result.output
+
+
+def test_cli_mlx_train_plan(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    data.mkdir()
+    _write_jsonl(data / "train.jsonl", [{"text": "hello"} for _ in range(5)])
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text(
+        json.dumps({"model_type": "tiny", "num_hidden_layers": 4, "hidden_size": 128}),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "mlx-train-plan",
+            "--model",
+            str(model),
+            "--data",
+            str(data),
+            "--batch-size",
+            "2",
+            "--grad-accumulation-steps",
+            "2",
+            "--iters",
+            "8",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "MLX training plan" in result.output
+    assert "effective_batch" in result.output
+    assert "estimated_epochs" in result.output

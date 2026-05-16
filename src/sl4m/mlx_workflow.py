@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import platform
 import subprocess
 import sys
@@ -28,6 +29,47 @@ class DatasetReport:
     files: tuple[str, ...]
     formats: dict[str, str]
     examples: dict[str, int]
+    chars: dict[str, int]
+
+    @property
+    def train_examples(self) -> int:
+        return self.examples.get("train.jsonl", 0)
+
+    @property
+    def train_chars(self) -> int:
+        return self.chars.get("train.jsonl", 0)
+
+    @property
+    def rough_train_tokens(self) -> int:
+        return max(1, self.train_chars // 4) if self.train_chars else 0
+
+
+@dataclass(frozen=True)
+class ModelConfigSummary:
+    path: Optional[Path]
+    model_type: Optional[str]
+    hidden_size: Optional[int]
+    intermediate_size: Optional[int]
+    num_hidden_layers: Optional[int]
+    num_attention_heads: Optional[int]
+    quantization_bits: Optional[int]
+
+
+@dataclass(frozen=True)
+class TrainPlan:
+    recipe: "TrainRecipe"
+    dataset: DatasetReport
+    model_config: ModelConfigSummary
+    effective_batch_size: int
+    optimizer_steps_per_epoch: int
+    estimated_epochs: float
+    trainable_layer_count: Optional[int]
+
+    @property
+    def rough_tokens_per_step(self) -> int:
+        if self.optimizer_steps_per_epoch <= 0:
+            return 0
+        return max(1, self.dataset.rough_train_tokens // self.optimizer_steps_per_epoch)
 
 
 def _coerce_path(value: str | Path) -> Path:
@@ -39,8 +81,9 @@ def _read_toml(path: str | Path) -> dict[str, Any]:
         return tomllib.load(f)
 
 
-def _first_jsonl_record(path: Path) -> tuple[dict[str, Any], int]:
+def _jsonl_summary(path: Path) -> tuple[dict[str, Any], int, int]:
     count = 0
+    chars = 0
     first: Optional[dict[str, Any]] = None
     with path.open("r", encoding="utf-8") as f:
         for lineno, line in enumerate(f, start=1):
@@ -55,9 +98,10 @@ def _first_jsonl_record(path: Path) -> tuple[dict[str, Any], int]:
                 raise WorkflowError(f"{path}:{lineno}: each JSONL record must be an object")
             if first is None:
                 first = obj
+            chars += len(line)
     if first is None:
         raise WorkflowError(f"{path}: file is empty")
-    return first, count
+    return first, count, chars
 
 
 def detect_dataset_format(record: dict[str, Any]) -> str:
@@ -90,11 +134,51 @@ def validate_dataset_dir(data_dir: str | Path, require: Iterable[str] = ("train.
     files = tuple(name for name in ("train.jsonl", "valid.jsonl", "test.jsonl") if (root / name).exists())
     formats: dict[str, str] = {}
     examples: dict[str, int] = {}
+    chars: dict[str, int] = {}
     for name in files:
-        first, count = _first_jsonl_record(root / name)
+        first, count, char_count = _jsonl_summary(root / name)
         formats[name] = detect_dataset_format(first)
         examples[name] = count
-    return DatasetReport(path=root, files=files, formats=formats, examples=examples)
+        chars[name] = char_count
+    return DatasetReport(path=root, files=files, formats=formats, examples=examples, chars=chars)
+
+
+def summarize_model_config(model: str | Path) -> ModelConfigSummary:
+    root = _coerce_path(model)
+    cfg_path = root / "config.json"
+    if not cfg_path.exists():
+        return ModelConfigSummary(
+            path=None,
+            model_type=None,
+            hidden_size=None,
+            intermediate_size=None,
+            num_hidden_layers=None,
+            num_attention_heads=None,
+            quantization_bits=None,
+        )
+    try:
+        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise WorkflowError(f"{cfg_path}: invalid model config JSON: {e}") from e
+    quant = raw.get("quantization") or raw.get("quantization_config") or {}
+    return ModelConfigSummary(
+        path=cfg_path,
+        model_type=raw.get("model_type") or raw.get("architectures", [None])[0],
+        hidden_size=_maybe_int(raw.get("hidden_size")),
+        intermediate_size=_maybe_int(raw.get("intermediate_size")),
+        num_hidden_layers=_maybe_int(raw.get("num_hidden_layers")),
+        num_attention_heads=_maybe_int(raw.get("num_attention_heads")),
+        quantization_bits=_maybe_int(quant.get("bits") or quant.get("bits_per_weight")),
+    )
+
+
+def _maybe_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def ensure_macos() -> None:
@@ -201,6 +285,28 @@ class TrainRecipe:
         _append_opt(args, "--project-name", self.project_name)
         _append_opt(args, "--resume-adapter-file", self.resume_adapter_file)
         return args
+
+    def plan(self) -> TrainPlan:
+        report = self.validate()
+        effective_batch = self.batch_size * self.grad_accumulation_steps
+        steps_per_epoch = max(1, math.ceil(report.train_examples / effective_batch))
+        model_config = summarize_model_config(self.model)
+        trainable_layers = (
+            model_config.num_hidden_layers
+            if self.num_layers == -1
+            else min(self.num_layers, model_config.num_hidden_layers)
+            if model_config.num_hidden_layers is not None
+            else self.num_layers
+        )
+        return TrainPlan(
+            recipe=self,
+            dataset=report,
+            model_config=model_config,
+            effective_batch_size=effective_batch,
+            optimizer_steps_per_epoch=steps_per_epoch,
+            estimated_epochs=self.iters / steps_per_epoch,
+            trainable_layer_count=trainable_layers,
+        )
 
 
 @dataclass(frozen=True)

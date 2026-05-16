@@ -5,6 +5,14 @@ An adaptive LLM runtime for running big models on constrained hardware.
 Targets the cases current tools do poorly:
 - 30-80B MoE models (A3B-style) on a laptop with 6-8GB VRAM + DDR4 RAM
 - Dense models on M-series Macs where unified memory pressure fluctuates with your workflow
+- Coding-agent edit/refactor loops where prompt structure repeats and decode strategy can be routed per task
+
+Current measured position: sl4m is not yet broadly better than MLX-LM,
+llama.cpp, Unsloth, or Cider across all workloads. It is already competitive
+with MLX-LM baseline on Apple Silicon and faster on measured Mac coding-agent
+edit/refactor tasks through PLD/adaptive PLD routing. The goal is to turn that
+narrow win into a reproducible Mac-first training, fine-tuning, and serving
+stack with explicit benchmarks against the popular libraries.
 
 ## Quickstart
 
@@ -31,6 +39,14 @@ Fine-tune and serve on Apple Silicon:
 ```bash
 # Dataset preflight. train.jsonl is required for training; valid.jsonl is optional.
 slam mlx-check-data data/my-sft
+
+# Plan the run before committing hours of Mac time.
+slam mlx-train-plan \
+  --model ~/Tools/models/Huihui-OmniCoder-9B-abliterated-4bit \
+  --data data/my-sft \
+  --batch-size 1 \
+  --grad-accumulation-steps 4 \
+  --iters 600
 
 # QLoRA if the base is already quantized, regular LoRA otherwise.
 slam mlx-train \
@@ -85,8 +101,9 @@ Measured wins on a RTX 3060 Laptop 6 GB: **+35%** on OmniCoder 9B (24 → 32.3 t
 | your situation | reach for |
 |---|---|
 | Mac, writing new code | `spec` (target + small draft of same family) |
-| Mac, editing / refactoring existing code | `pld` (draftless; wins from prompt repetition) |
-| Mac, long-context edit + wants correctness gate | `pld --temperature 0.0` (auto baseline diff) |
+| Mac, editing / refactoring existing code | `agent-run` / `agent-bench` auto route to adaptive PLD |
+| Mac, long-context edit + wants correctness gate | `pld --temperature 0.0` or `agent-bench` validators |
+| Mac, preparing fine-tuning | `mlx-check-data` then `mlx-train-plan` before `mlx-train` |
 | Linux laptop GPU, just want best t/s | `lc-sweep` then paste the winning command |
 | Linux laptop GPU, MoE model (A3B-style) | `lc-sweep` — it's MoE-aware, sweeps `--n-cpu-moe` |
 | Investigating an MoE's routing skew | `tools/routing_observe.py` |
@@ -115,6 +132,7 @@ What's interface-only (NotImplementedError):
 
 New Mac/MLX training surface:
 - `slam mlx-check-data` — validates MLX-LM JSONL datasets before training/eval
+- `slam mlx-train-plan` — estimates effective batch, steps/epoch, rough token volume, trainable layers, and local model config
 - `slam mlx-train` — LoRA/QLoRA/DoRA/full fine-tuning wrapper with Mac-safe defaults
 - `slam mlx-eval` — adapter perplexity eval through MLX-LM
 - `slam mlx-fuse` — fuse adapters into standalone MLX models
@@ -139,7 +157,8 @@ slam mac-linear-bench --profile tiny --repeats 20
 slam mac-linear-bench --shapes 1x4096x4096,256x4096x14336 --repeats 10
 ```
 
-For the first row-wise reduction candidate:
+For row-wise reduction candidates, benchmark plain RMSNorm and residual-add
+RMSNorm fusion:
 
 ```bash
 slam mac-norm-bench --rows 256 --hidden 4096 --repeats 50

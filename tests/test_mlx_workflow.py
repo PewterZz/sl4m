@@ -12,6 +12,7 @@ from sl4m.mlx_workflow import (
     TrainRecipe,
     WorkflowError,
     detect_dataset_format,
+    summarize_model_config,
     validate_dataset_dir,
 )
 
@@ -45,6 +46,8 @@ def test_validate_dataset_dir_reports_files(tmp_path: Path) -> None:
     assert report.formats["train.jsonl"] == "chat"
     assert report.formats["valid.jsonl"] == "completions"
     assert report.examples["train.jsonl"] == 1
+    assert report.train_examples == 1
+    assert report.rough_train_tokens > 0
 
 
 def test_validate_dataset_dir_requires_train(tmp_path: Path) -> None:
@@ -100,6 +103,51 @@ mask_prompt = false
     assert recipe.iters == 12
     assert recipe.fine_tune_type == "dora"
     assert recipe.mask_prompt is False
+
+
+def test_train_recipe_plan_reads_local_model_config(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    data.mkdir()
+    _write_jsonl(data / "train.jsonl", [{"text": "hello world"} for _ in range(9)])
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3",
+                "hidden_size": 4096,
+                "intermediate_size": 12288,
+                "num_hidden_layers": 32,
+                "num_attention_heads": 32,
+                "quantization": {"bits": 4},
+            }
+        ),
+        encoding="utf-8",
+    )
+    recipe = TrainRecipe(
+        model=str(model),
+        data=data,
+        iters=20,
+        batch_size=2,
+        grad_accumulation_steps=2,
+        num_layers=12,
+    )
+
+    plan = recipe.plan()
+
+    assert plan.model_config.model_type == "qwen3"
+    assert plan.model_config.quantization_bits == 4
+    assert plan.effective_batch_size == 4
+    assert plan.optimizer_steps_per_epoch == 3
+    assert plan.estimated_epochs == pytest.approx(20 / 3)
+    assert plan.trainable_layer_count == 12
+
+
+def test_summarize_model_config_missing_config_is_unknown(tmp_path: Path) -> None:
+    summary = summarize_model_config(tmp_path)
+
+    assert summary.path is None
+    assert summary.hidden_size is None
 
 
 def test_eval_recipe_requires_test_jsonl(tmp_path: Path) -> None:

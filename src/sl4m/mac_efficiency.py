@@ -597,10 +597,16 @@ def run_rms_norm_bench(
     except ImportError as e:  # pragma: no cover - optional dependency
         raise RuntimeError("mlx is not installed. Install with `pip install -e '.[mac]'`.") from e
 
-    from .metal_kernels import reference_rms_norm, rms_norm
+    from .metal_kernels import (
+        reference_residual_rms_norm,
+        reference_rms_norm,
+        residual_rms_norm,
+        rms_norm,
+    )
 
     mx_dtype = getattr(mx, dtype)
     x = mx.random.normal((rows, hidden)).astype(mx_dtype)
+    residual = mx.random.normal((rows, hidden)).astype(mx_dtype)
     weight = mx.random.normal((hidden,)).astype(mx_dtype)
 
     custom = rms_norm(x, weight, eps=eps)
@@ -636,7 +642,23 @@ def run_rms_norm_bench(
             },
         )
 
+    residual_custom = residual_rms_norm(x, residual, weight, eps=eps)
+    residual_ref = reference_residual_rms_norm(x, residual, weight, eps=eps)
+    if not bool(mx.allclose(residual_custom, residual_ref, rtol=1e-3, atol=1e-3).item()):
+        max_err = float(mx.max(mx.abs(residual_custom - residual_ref)).item())
+        raise RuntimeError(
+            f"custom residual_rms_norm failed correctness check; max_err={max_err:.4g}"
+        )
+
     return [
         measure("mlx-reference-rms-norm", lambda: reference_rms_norm(x, weight, eps=eps)),
         measure("slam-metal-rms-norm", lambda: rms_norm(x, weight, eps=eps)),
+        measure(
+            "mlx-reference-residual-rms-norm",
+            lambda: reference_residual_rms_norm(x, residual, weight, eps=eps),
+        ),
+        measure(
+            "slam-metal-residual-rms-norm",
+            lambda: residual_rms_norm(x, residual, weight, eps=eps),
+        ),
     ]
