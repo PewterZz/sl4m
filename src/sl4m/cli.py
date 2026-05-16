@@ -9,7 +9,14 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from .adaptive_pld import resolve_agent_mode
 from .agent import route_agent_prompt
+from .agent_bench import (
+    load_agent_tasks,
+    run_agent_bench,
+    validate_modes,
+    write_agent_bench_jsonl,
+)
 from .backend import GenerationSettings, LlamaCppBackend, MLXBackend
 from .budget import StaticBudget, Tier, auto_detect_limits
 from .kernel_harness import (
@@ -108,7 +115,7 @@ def run(
 def agent_run(
     model: str = typer.Argument(..., help="HF repo id or local MLX model path"),
     prompt: str = typer.Option(..., help="Agent task prompt"),
-    mode: str = typer.Option("auto", help="auto | baseline | pld"),
+    mode: str = typer.Option("auto", help="auto | baseline | pld | adaptive-pld"),
     max_tokens: int = typer.Option(256),
     temperature: float = typer.Option(0.0),
     num_draft: int = typer.Option(4),
@@ -120,9 +127,9 @@ def agent_run(
 ):
     """Run an agentic prompt with conservative auto-routing for Mac edit workflows."""
     route = route_agent_prompt(prompt)
-    selected_mode = route.mode if mode == "auto" else mode
-    if selected_mode not in {"baseline", "pld"}:
-        raise typer.BadParameter("mode must be auto, baseline, or pld")
+    selected_mode = resolve_agent_mode(mode, route.mode)
+    if selected_mode not in {"baseline", "pld", "adaptive-pld"}:
+        raise typer.BadParameter("mode must be auto, baseline, pld, or adaptive-pld")
 
     console.print(
         f"[cyan]agent route[/cyan] mode={selected_mode} "
@@ -158,6 +165,14 @@ def agent_run(
                 max_ngram_size=max_ngram,
                 min_ngram_size=min_ngram,
             )
+        elif selected_mode == "adaptive-pld":
+            stream = session.generate_adaptive_pld(
+                prompt,
+                settings,
+                num_draft=num_draft,
+                max_ngram_size=max_ngram,
+                min_ngram_size=min_ngram,
+            )
         else:
             stream = session.generate(prompt, settings)
         for tok in stream:
@@ -165,6 +180,74 @@ def agent_run(
         console.print()
     finally:
         session.close()
+
+
+@app.command("agent-bench")
+def agent_bench(
+    tasks_path: str = typer.Argument(..., help="TOML task file or directory of task files"),
+    model: Optional[str] = typer.Option(None, help="HF repo id or local MLX model path"),
+    modes: str = typer.Option("baseline,pld,adaptive-pld,agent-auto"),
+    headroom_gb: float = typer.Option(4.0),
+    num_draft: int = typer.Option(4),
+    max_ngram: int = typer.Option(3),
+    min_ngram: int = typer.Option(2),
+    jsonl: Optional[str] = typer.Option(None),
+    dry_run: bool = typer.Option(False, help="Validate tasks and print routing without loading a model"),
+):
+    """Benchmark agentic edit tasks across baseline, PLD, adaptive PLD, and auto routing."""
+    try:
+        tasks = load_agent_tasks(tasks_path)
+        selected_modes = validate_modes([m.strip() for m in modes.split(",")])
+    except ValueError as e:
+        raise typer.BadParameter(str(e)) from e
+
+    if dry_run:
+        table = Table(title="Agent benchmark tasks")
+        table.add_column("task")
+        table.add_column("prompt chars", justify="right")
+        table.add_column("auto")
+        table.add_column("confidence", justify="right")
+        table.add_column("validations")
+        for task in tasks:
+            route = route_agent_prompt(task.prompt)
+            table.add_row(
+                task.name,
+                str(len(task.prompt)),
+                route.mode,
+                f"{route.confidence:.2f}",
+                ",".join(v.kind for v in task.validations) or "none",
+            )
+        console.print(table)
+        return
+
+    if not model:
+        raise typer.BadParameter("--model is required unless --dry-run is set")
+
+    results = run_agent_bench(
+        tasks=tasks,
+        model=model,
+        modes=selected_modes,
+        headroom_gb=headroom_gb,
+        num_draft=num_draft,
+        max_ngram=max_ngram,
+        min_ngram=min_ngram,
+    )
+    table = Table(title="Agent benchmark")
+    for col in ("task", "mode", "selected", "tokens", "tok/s", "valid", "peak GB"):
+        table.add_column(col, justify="right" if col in {"tokens", "tok/s", "peak GB"} else "left")
+    for result in results:
+        table.add_row(
+            result.task,
+            result.mode,
+            result.selected_mode,
+            str(result.tokens),
+            f"{result.tok_s:.2f}",
+            "yes" if result.validation_ok else "no",
+            f"{result.peak_mem_gb:.2f}" if result.peak_mem_gb is not None else "n/a",
+        )
+    console.print(table)
+    if jsonl:
+        write_agent_bench_jsonl(jsonl, results)
 
 
 @app.command("mlx-check-data")

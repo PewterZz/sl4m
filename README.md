@@ -160,8 +160,10 @@ slam mac-compare ~/Tools/models/Huihui-OmniCoder-9B-abliterated-4bit \
   --jsonl runs/omnicoder-9b-direct-vs-slam.jsonl
 ```
 
-For coding-agent tasks, `agent-run` routes edit-shaped prompts to PLD and keeps
-open-ended prompts on baseline:
+For coding-agent tasks, `agent-run` routes edit-shaped prompts to adaptive PLD
+and keeps open-ended prompts on baseline. Adaptive PLD starts with prompt lookup
+and falls back to baseline continuation when early lookup rounds show too few
+matches or accepted draft tokens:
 
 ```bash
 slam agent-run ~/Tools/models/Huihui-OmniCoder-9B-abliterated-4bit \
@@ -169,6 +171,15 @@ slam agent-run ~/Tools/models/Huihui-OmniCoder-9B-abliterated-4bit \
 
 Refactor the code above for clarity. Preserve behavior and return only updated code." \
   --max-tokens 256
+```
+
+Benchmark agent workflows across baseline, PLD, adaptive PLD, and auto routing:
+
+```bash
+slam agent-bench benchmarks/agent_tasks \
+  --model ~/Tools/models/Huihui-OmniCoder-9B-abliterated-4bit \
+  --modes baseline,pld,adaptive-pld,agent-auto \
+  --jsonl runs/agent-bench.jsonl
 ```
 
 ## Speculative decoding

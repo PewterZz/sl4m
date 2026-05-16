@@ -97,7 +97,8 @@ def test_cli_agent_run_dry_run_routes_edit_prompt_to_pld() -> None:
     )
 
     assert result.exit_code == 0
-    assert "mode=pld" in result.output
+    assert "mode=adaptive-pld" in result.output
+    assert "auto=pld" in result.output
 
 
 def test_cli_agent_run_rejects_bad_mode() -> None:
@@ -107,7 +108,44 @@ def test_cli_agent_run_rejects_bad_mode() -> None:
     )
 
     assert result.exit_code != 0
-    assert "mode must be auto, baseline, or pld" in result.output
+    assert "mode must be auto, baseline, pld, or adaptive-pld" in result.output
+
+
+def test_cli_agent_bench_dry_run(tmp_path: Path) -> None:
+    task = tmp_path / "task.toml"
+    task.write_text(
+        """
+[task]
+name = "sample"
+context = "def f(x):\\n    return x + 1\\n"
+instruction = "Refactor the code above. Preserve behavior and return only code."
+validations = ["python-ast"]
+""".strip(),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["agent-bench", str(tmp_path), "--dry-run"])
+
+    assert result.exit_code == 0
+    assert "sample" in result.output
+    assert "python-ast" in result.output
+
+
+def test_cli_agent_bench_requires_model_without_dry_run(tmp_path: Path) -> None:
+    task = tmp_path / "task.toml"
+    task.write_text(
+        """
+[task]
+name = "sample"
+instruction = "Write code."
+""".strip(),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["agent-bench", str(tmp_path)])
+
+    assert result.exit_code != 0
+    assert "--model is required" in result.output
 
 
 def test_cli_mlx_train_dry_run_from_recipe(tmp_path: Path) -> None:

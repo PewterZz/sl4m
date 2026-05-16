@@ -119,7 +119,13 @@ slam mac-compare ~/Tools/models/Huihui-OmniCoder-9B-abliterated-4bit \
 Agentic coding workloads split into two broad classes:
 
 - open generation: use baseline MLX generation
-- edit/refactor/fix tasks over pasted code: use PLD
+- edit/refactor/fix tasks over pasted code: use adaptive PLD
+
+Adaptive PLD starts with prompt lookup decoding and watches early per-round
+telemetry. If the first window has too few prompt matches or too few accepted
+draft tokens, it switches to baseline continuation for the remaining token
+budget. This keeps the edit-workload PLD win while limiting the short/open task
+slowdown we measured under low hit rates.
 
 The `agent-run` command applies this conservative route:
 
@@ -134,6 +140,20 @@ Refactor the code above for clarity. Preserve behavior and return only updated c
 
 Use `--dry-run` to inspect the decision without loading the model. The route is
 recorded in telemetry as `agent_route`.
+
+Benchmark full agent tasks with validation:
+
+```bash
+slam agent-bench benchmarks/agent_tasks --dry-run
+slam agent-bench benchmarks/agent_tasks \
+  --model ~/Tools/models/Huihui-OmniCoder-9B-abliterated-4bit \
+  --modes baseline,pld,adaptive-pld,agent-auto \
+  --jsonl runs/agent-bench.jsonl
+```
+
+Task files are TOML and can define context, instructions, expected output type,
+token settings, and validators such as `python-ast`, `py-compile`, and
+`contains`.
 
 ## Linear Kernel Harness
 

@@ -1,0 +1,16 @@
+[task]
+name = "type_hints_refactor"
+context_file = "fixtures/math_utils.py"
+instruction = """
+Refactor the code above for clarity and type safety.
+Preserve behavior, add Python type hints, keep the same function names, and return only the updated Python code.
+"""
+output = "code"
+max_tokens = 192
+temperature = 0.0
+validations = [
+  "python-ast",
+  "py-compile",
+  { kind = "contains", value = "def fib" },
+  { kind = "contains", value = "-> int" },
+]
