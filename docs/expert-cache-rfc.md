@@ -22,7 +22,7 @@ _Source: [`expert-cache-dataflow.excalidraw`](expert-cache-dataflow.excalidraw) 
   (~40 GB/s theoretical, ~12-15 GB/s PCIe Gen3 x4 on a laptop) this is the
   binding bottleneck.
 
-The sweep measurements in the README (`slim-ml lc-sweep` run April 2026, RTX 3060
+The sweep measurements in the README (`slam lc-sweep` run April 2026, RTX 3060
 Laptop 6 GB) show the tradeoff cliff: landing 14 of 40 expert layers on GPU
 buys +22% t/s at the cost of dropping ctx 128K→16K. The other 26 layers still
 pay the PCIe tax every token.
@@ -56,7 +56,7 @@ the kernel work first would be betting a week+ on an unmeasured distribution.
 
 ### Kill criteria (stated up front so future-me can't rewrite them)
 
-Before writing CUDA, run `slim-ml/tools/routing_observe.py` against an MLX port
+Before writing CUDA, run `slam/tools/routing_observe.py` against an MLX port
 of Qwen3-30B-A3B or Qwen3.6-35B-A3B on a **coding-workload prompt** ≥500 tokens
 (the actual workload for this build, not OLMoE's multi-topic essay which
 deliberately spreads routes). Record top-5/10/20% capture aggregate and
@@ -201,14 +201,14 @@ expert offloading with caches). I haven't surveyed exhaustively; the novel part
 here is the llama.cpp-specific implementation and the RTX 3060-class target.
 Will compare to prior art before §stage 3.
 
-## 7. What lands in slim-ml from this RFC
+## 7. What lands in sl4m from this RFC
 
-Independent of llama.cpp C++ work, slim-ml gains:
+Independent of llama.cpp C++ work, sl4m gains:
 
-- `slim-ml lc-moe-probe MODEL.gguf` — new CLI that loads the MoE model into
+- `slam lc-moe-probe MODEL.gguf` — new CLI that loads the MoE model into
   llama.cpp with a lightweight router-logging build (stage-1 instrumentation)
   and reports routing distribution. Parallel to MLX's `routing_observe.py`
   but on the actual runtime the cache would target.
 - RFC doc itself (this file).
 - Revised `technique.py` entry for `expert_cache` with the stage-gate state
-  machine exposed to `slim-ml techniques`.
+  machine exposed to `slam techniques`.

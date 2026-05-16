@@ -3,9 +3,9 @@
 The core algorithm is a direct port of mlx_lm.generate.speculative_generate_step,
 extended with ArraysCache snapshot/restore so hybrid models (linear + full
 attention) can speculate correctly. The upstream fix lives in mlx-lm PR #1111;
-slim-ml carries its own copy here so users don't have to pin a fork.
+slam carries its own copy here so users don't have to pin a fork.
 
-slim-ml value-add over upstream: per-verify-round telemetry via the recorder.
+slam value-add over upstream: per-verify-round telemetry via the recorder.
 Each round emits `spec_round` with `{round, num_draft, num_accept, verify_ms,
 replay_ms}`, and generation_end includes aggregate acceptance + mean accept/round.
 
@@ -67,7 +67,7 @@ def speculative_step(
         bad = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
         raise ValueError(
             f"Non-hybrid prompt cache is not trimmable: {bad}. "
-            "slim-ml spec decode handles ArraysCache but not arbitrary non-trimmable caches."
+            "slam spec decode handles ArraysCache but not arbitrary non-trimmable caches."
         )
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
@@ -240,7 +240,7 @@ def speculative_step_pld(
         bad = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
         raise ValueError(
             f"Non-hybrid prompt cache is not trimmable: {bad}. "
-            "slim-ml PLD handles ArraysCache but not arbitrary non-trimmable caches."
+            "slam PLD handles ArraysCache but not arbitrary non-trimmable caches."
         )
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
@@ -412,7 +412,7 @@ def speculative_step_hybrid(
         bad = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
         raise ValueError(
             f"Non-hybrid prompt cache is not trimmable: {bad}. "
-            "slim-ml hybrid handles ArraysCache but not arbitrary non-trimmable caches."
+            "slam hybrid handles ArraysCache but not arbitrary non-trimmable caches."
         )
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))

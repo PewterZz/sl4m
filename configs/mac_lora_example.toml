@@ -1,0 +1,12 @@
+[train]
+model = "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"
+data = "data/my-sft"
+adapter_path = "adapters/qwen2.5-coder"
+fine_tune_type = "lora"
+iters = 600
+batch_size = 1
+learning_rate = 0.00001
+num_layers = 16
+grad_accumulation_steps = 4
+grad_checkpoint = true
+mask_prompt = true

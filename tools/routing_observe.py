@@ -1,4 +1,4 @@
-"""Profile MoE routing on a small MoE via slim-ml's route-observation hook.
+"""Profile MoE routing on a small MoE via sl4m's route-observation hook.
 
 Stage 0 of expert caching: confirm experimentally that expert routing is
 skewed enough (Zipfian-ish) that a hot-set covering some small fraction of
@@ -18,9 +18,9 @@ import argparse
 import sys
 from collections import Counter, defaultdict
 
-from slim_ml.backend import GenerationSettings, MLXBackend
-from slim_ml.budget import StaticBudget, auto_detect_limits
-from slim_ml.runtime import Session
+from sl4m.backend import GenerationSettings, MLXBackend
+from sl4m.budget import StaticBudget, auto_detect_limits
+from sl4m.runtime import Session
 
 
 def capture_at(sorted_hits: list[int], total: int, frac_experts: float) -> float:

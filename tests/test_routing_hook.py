@@ -14,7 +14,7 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 switch_layers = pytest.importorskip("mlx_lm.models.switch_layers")
 
-from slim_ml.backend import _ROUTE_STATE, _patch_switch_class_once
+from sl4m.backend import _ROUTE_STATE, _patch_switch_class_once
 
 
 def test_hook_fires_and_cleans_up():
