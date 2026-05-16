@@ -62,7 +62,7 @@ slam mlx-train --recipe configs/mac_lora_example.toml
 
 # Evaluate on test.jsonl, then fuse adapters into a standalone MLX model.
 slam mlx-eval --model mlx-community/Qwen2.5-Coder-7B-Instruct-4bit \
-  --data data/my-sft --adapter-path adapters/qwen2.5-coder
+  --data data/my-sft --adapter-path adapters/qwen2.5-coder --batch-size 1
 slam mlx-fuse --model mlx-community/Qwen2.5-Coder-7B-Instruct-4bit \
   --adapter-path adapters/qwen2.5-coder --save-path fused/qwen2.5-coder
 
@@ -74,6 +74,30 @@ slam mlx-serve --model mlx-community/Qwen2.5-Coder-7B-Instruct-4bit \
 MLX-LM accepts local JSONL datasets in `chat`, `tools`, `completions`, or
 `text` format. `slam mlx-check-data` validates the split files before a
 long Mac training run starts.
+
+Tiny local smoke training is available for pipeline checks:
+
+```bash
+slam mlx-train \
+  --model ~/Tools/models/Huihui-OmniCoder-9B-abliterated-4bit \
+  --data benchmarks/finetune_smoke \
+  --adapter-path runs/adapters/omnicoder-9b-smoke \
+  --iters 2 \
+  --batch-size 1 \
+  --grad-accumulation-steps 1 \
+  --num-layers 1
+
+slam mlx-eval \
+  --model ~/Tools/models/Huihui-OmniCoder-9B-abliterated-4bit \
+  --data benchmarks/finetune_smoke \
+  --adapter-path runs/adapters/omnicoder-9b-smoke \
+  --batch-size 1 \
+  --test-batches 1
+```
+
+This is a pipeline smoke test, not a quality recipe. On the local OmniCoder 9B
+4-bit model, the 2-iteration run trained 0.639M parameters, reached 13.955
+tokens/s, peaked at 6.148 GB, and saved a 2.4 MB adapter.
 
 Don't know which draft pair works for your target? `slam spec-sweep` tries
 `num_draft ∈ {1,2,4,6,8}` and prints a ranked table.

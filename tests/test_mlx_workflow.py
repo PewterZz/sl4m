@@ -68,7 +68,7 @@ def test_train_recipe_command_uses_mac_memory_defaults(tmp_path: Path) -> None:
 
     cmd = recipe.to_command()
 
-    assert cmd[:3] == [sys.executable, "-m", "mlx_lm.lora"]
+    assert cmd[:4] == [sys.executable, "-m", "mlx_lm", "lora"]
     assert "--train" in cmd
     assert cmd[cmd.index("--model") + 1] == recipe.model
     assert cmd[cmd.index("--data") + 1] == str(tmp_path)
@@ -143,6 +143,36 @@ def test_train_recipe_plan_reads_local_model_config(tmp_path: Path) -> None:
     assert plan.trainable_layer_count == 12
 
 
+def test_train_recipe_plan_reads_nested_text_config(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    data.mkdir()
+    _write_jsonl(data / "train.jsonl", [{"text": "hello"}])
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_5",
+                "quantization": {"bits": 4},
+                "text_config": {
+                    "hidden_size": 4096,
+                    "intermediate_size": 12288,
+                    "num_hidden_layers": 32,
+                    "num_attention_heads": 16,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    plan = TrainRecipe(model=str(model), data=data, num_layers=-1).plan()
+
+    assert plan.model_config.hidden_size == 4096
+    assert plan.model_config.intermediate_size == 12288
+    assert plan.model_config.num_hidden_layers == 32
+    assert plan.trainable_layer_count == 32
+
+
 def test_summarize_model_config_missing_config_is_unknown(tmp_path: Path) -> None:
     summary = summarize_model_config(tmp_path)
 
@@ -156,6 +186,22 @@ def test_eval_recipe_requires_test_jsonl(tmp_path: Path) -> None:
 
     with pytest.raises(WorkflowError, match="test.jsonl"):
         recipe.to_command()
+
+
+def test_eval_recipe_command_supports_small_test_batch(tmp_path: Path) -> None:
+    _write_jsonl(tmp_path / "test.jsonl", [{"text": "hello"}])
+
+    cmd = EvalRecipe(
+        model="mlx-community/test",
+        data=tmp_path,
+        batch_size=1,
+        test_batches=1,
+    ).to_command()
+
+    assert cmd[:4] == [sys.executable, "-m", "mlx_lm", "lora"]
+    assert cmd[cmd.index("--batch-size") + 1] == "1"
+    assert cmd[cmd.index("--test-batches") + 1] == "1"
+    assert "--test" in cmd
 
 
 def test_serve_recipe_command_includes_adapters_and_draft(tmp_path: Path) -> None:

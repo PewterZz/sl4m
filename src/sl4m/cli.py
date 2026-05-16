@@ -285,7 +285,7 @@ def mlx_train(
     grad_checkpoint: bool = typer.Option(True, help="Trade compute for lower memory"),
     mask_prompt: bool = typer.Option(True, help="Train loss on completions only for chat/completion data"),
     recipe: Optional[str] = typer.Option(None, help="TOML recipe with a [train] table"),
-    dry_run: bool = typer.Option(False, help="Print the mlx_lm.lora command without running it"),
+    dry_run: bool = typer.Option(False, help="Print the MLX-LM LoRA command without running it"),
 ):
     """Mac-first LoRA/QLoRA/DoRA fine-tuning via MLX-LM."""
     try:
@@ -388,6 +388,8 @@ def mlx_eval(
     model: str = typer.Option(..., help="HF repo id or local MLX model path"),
     data: str = typer.Option(..., help="Dataset directory with test.jsonl"),
     adapter_path: str = typer.Option("adapters"),
+    batch_size: int = typer.Option(4),
+    test_batches: int = typer.Option(-1),
     dry_run: bool = typer.Option(False),
 ):
     """Evaluate adapter perplexity through MLX-LM."""
@@ -398,6 +400,8 @@ def mlx_eval(
             model=model,
             data=Path(data),
             adapter_path=Path(adapter_path),
+            batch_size=batch_size,
+            test_batches=test_batches,
         )
         cfg.validate()
     except WorkflowError as e:

@@ -167,7 +167,7 @@ iters = 2
     result = runner.invoke(app, ["mlx-train", "--recipe", str(recipe), "--dry-run"])
 
     assert result.exit_code == 0
-    assert "mlx_lm.lora" in result.output
+    assert "mlx_lm lora" in result.output
     assert "--adapter-path" in result.output
 
 

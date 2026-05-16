@@ -160,14 +160,15 @@ def summarize_model_config(model: str | Path) -> ModelConfigSummary:
         raw = json.loads(cfg_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
         raise WorkflowError(f"{cfg_path}: invalid model config JSON: {e}") from e
+    text = raw.get("text_config") if isinstance(raw.get("text_config"), dict) else {}
     quant = raw.get("quantization") or raw.get("quantization_config") or {}
     return ModelConfigSummary(
         path=cfg_path,
-        model_type=raw.get("model_type") or raw.get("architectures", [None])[0],
-        hidden_size=_maybe_int(raw.get("hidden_size")),
-        intermediate_size=_maybe_int(raw.get("intermediate_size")),
-        num_hidden_layers=_maybe_int(raw.get("num_hidden_layers")),
-        num_attention_heads=_maybe_int(raw.get("num_attention_heads")),
+        model_type=raw.get("model_type") or text.get("model_type") or raw.get("architectures", [None])[0],
+        hidden_size=_maybe_int(raw.get("hidden_size") or text.get("hidden_size")),
+        intermediate_size=_maybe_int(raw.get("intermediate_size") or text.get("intermediate_size")),
+        num_hidden_layers=_maybe_int(raw.get("num_hidden_layers") or text.get("num_hidden_layers")),
+        num_attention_heads=_maybe_int(raw.get("num_attention_heads") or text.get("num_attention_heads")),
         quantization_bits=_maybe_int(quant.get("bits") or quant.get("bits_per_weight")),
     )
 
@@ -255,7 +256,8 @@ class TrainRecipe:
         args = [
             sys.executable,
             "-m",
-            "mlx_lm.lora",
+            "mlx_lm",
+            "lora",
             "--model",
             self.model,
             "--train",
@@ -314,8 +316,12 @@ class EvalRecipe:
     model: str
     data: Path
     adapter_path: Path = Path("adapters")
+    batch_size: int = 4
+    test_batches: int = -1
 
     def validate(self) -> DatasetReport:
+        if self.batch_size <= 0:
+            raise WorkflowError("batch_size must be > 0")
         return validate_dataset_dir(self.data, require=("test.jsonl",))
 
     def to_command(self) -> list[str]:
@@ -323,13 +329,18 @@ class EvalRecipe:
         return [
             sys.executable,
             "-m",
-            "mlx_lm.lora",
+            "mlx_lm",
+            "lora",
             "--model",
             self.model,
             "--adapter-path",
             str(self.adapter_path),
             "--data",
             str(self.data),
+            "--batch-size",
+            str(self.batch_size),
+            "--test-batches",
+            str(self.test_batches),
             "--test",
         ]
 
