@@ -82,6 +82,7 @@ class AdapterBenchResult:
     rank: Optional[int]
     scale: Optional[float]
     dropout: Optional[float]
+    learning_rate: float
     adapter_path: Path
     train_seconds: float
     train_returncode: int
@@ -571,10 +572,10 @@ def run_adapter_bench(
     ranks: Iterable[int] = (8,),
     scales: Iterable[float] = (20.0,),
     dropouts: Iterable[float] = (0.0,),
+    learning_rates: Iterable[float] = (1e-5,),
     iters: int,
     batch_size: int = 1,
     grad_accumulation_steps: int = 1,
-    learning_rate: float = 1e-5,
     optimizer: Optional[str] = None,
     val_batches: int = 1,
     test_batches: int = 1,
@@ -588,90 +589,94 @@ def run_adapter_bench(
             for rank in ranks:
                 for scale in scales:
                     for dropout in dropouts:
-                        name = (
-                            f"{fine_tune_type}-layers{layers}-"
-                            f"r{rank}-a{scale:g}-d{dropout:g}"
-                        )
-                        adapter_path = output_dir / name
-                        recipe = TrainRecipe(
-                            model=model,
-                            data=data,
-                            adapter_path=adapter_path,
-                            fine_tune_type=fine_tune_type,
-                            iters=iters,
-                            batch_size=batch_size,
-                            learning_rate=learning_rate,
-                            num_layers=layers,
-                            grad_accumulation_steps=grad_accumulation_steps,
-                            optimizer=optimizer,
-                            val_batches=val_batches,
-                            max_seq_length=max_seq_length,
-                            seed=seed,
-                            lora_rank=rank,
-                            lora_scale=scale,
-                            lora_dropout=dropout,
-                        ).write_config(adapter_path / "slam_lora_config.json")
-                        t0 = time.monotonic()
-                        train = subprocess.run(
-                            recipe.to_command(), capture_output=True, text=True, check=False
-                        )
-                        train_seconds = time.monotonic() - t0
-                        train_text = f"{train.stdout}\n{train.stderr}"
-                        metrics = parse_mlx_lora_output(train_text)
-
-                        eval_seconds: Optional[float] = None
-                        eval_returncode: Optional[int] = None
-                        eval_stdout = ""
-                        eval_stderr = ""
-                        if train.returncode == 0 and (data / "test.jsonl").exists():
-                            eval_recipe = EvalRecipe(
+                        for learning_rate in learning_rates:
+                            name = (
+                                f"{fine_tune_type}-layers{layers}-"
+                                f"r{rank}-a{scale:g}-d{dropout:g}-lr{learning_rate:g}"
+                            )
+                            adapter_path = output_dir / name
+                            recipe = TrainRecipe(
                                 model=model,
                                 data=data,
                                 adapter_path=adapter_path,
-                                batch_size=batch_size,
-                                test_batches=test_batches,
-                            )
-                            t_eval = time.monotonic()
-                            eval_proc = subprocess.run(
-                                eval_recipe.to_command(),
-                                capture_output=True,
-                                text=True,
-                                check=False,
-                            )
-                            eval_seconds = time.monotonic() - t_eval
-                            eval_returncode = eval_proc.returncode
-                            eval_stdout = eval_proc.stdout
-                            eval_stderr = eval_proc.stderr
-                            metrics.update(parse_mlx_lora_output(f"{eval_stdout}\n{eval_stderr}"))
-
-                        results.append(
-                            AdapterBenchResult(
-                                name=name,
                                 fine_tune_type=fine_tune_type,
+                                iters=iters,
+                                batch_size=batch_size,
+                                learning_rate=learning_rate,
                                 num_layers=layers,
-                                rank=rank,
-                                scale=scale,
-                                dropout=dropout,
-                                adapter_path=adapter_path,
-                                train_seconds=train_seconds,
-                                train_returncode=train.returncode,
-                                eval_seconds=eval_seconds,
-                                eval_returncode=eval_returncode,
-                                train_loss=metrics.get("train_loss"),
-                                val_loss=metrics.get("val_loss"),
-                                test_loss=metrics.get("test_loss"),
-                                test_ppl=metrics.get("test_ppl"),
-                                it_per_sec=metrics.get("it_per_sec"),
-                                tokens_per_sec=metrics.get("tokens_per_sec"),
-                                trained_tokens=metrics.get("trained_tokens"),
-                                peak_mem_gb=metrics.get("peak_mem_gb"),
-                                trainable_params_m=metrics.get("trainable_params_m"),
-                                trainable_pct=metrics.get("trainable_pct"),
-                                adapter_size_mb=_adapter_size_mb(adapter_path),
-                                stdout_tail=(train.stdout + eval_stdout)[-4000:],
-                                stderr_tail=(train.stderr + eval_stderr)[-4000:],
+                                grad_accumulation_steps=grad_accumulation_steps,
+                                optimizer=optimizer,
+                                val_batches=val_batches,
+                                max_seq_length=max_seq_length,
+                                seed=seed,
+                                lora_rank=rank,
+                                lora_scale=scale,
+                                lora_dropout=dropout,
+                            ).write_config(adapter_path / "slam_lora_config.json")
+                            t0 = time.monotonic()
+                            train = subprocess.run(
+                                recipe.to_command(), capture_output=True, text=True, check=False
                             )
-                        )
+                            train_seconds = time.monotonic() - t0
+                            train_text = f"{train.stdout}\n{train.stderr}"
+                            metrics = parse_mlx_lora_output(train_text)
+
+                            eval_seconds: Optional[float] = None
+                            eval_returncode: Optional[int] = None
+                            eval_stdout = ""
+                            eval_stderr = ""
+                            if train.returncode == 0 and (data / "test.jsonl").exists():
+                                eval_recipe = EvalRecipe(
+                                    model=model,
+                                    data=data,
+                                    adapter_path=adapter_path,
+                                    batch_size=batch_size,
+                                    test_batches=test_batches,
+                                )
+                                t_eval = time.monotonic()
+                                eval_proc = subprocess.run(
+                                    eval_recipe.to_command(),
+                                    capture_output=True,
+                                    text=True,
+                                    check=False,
+                                )
+                                eval_seconds = time.monotonic() - t_eval
+                                eval_returncode = eval_proc.returncode
+                                eval_stdout = eval_proc.stdout
+                                eval_stderr = eval_proc.stderr
+                                metrics.update(
+                                    parse_mlx_lora_output(f"{eval_stdout}\n{eval_stderr}")
+                                )
+
+                            results.append(
+                                AdapterBenchResult(
+                                    name=name,
+                                    fine_tune_type=fine_tune_type,
+                                    num_layers=layers,
+                                    rank=rank,
+                                    scale=scale,
+                                    dropout=dropout,
+                                    learning_rate=learning_rate,
+                                    adapter_path=adapter_path,
+                                    train_seconds=train_seconds,
+                                    train_returncode=train.returncode,
+                                    eval_seconds=eval_seconds,
+                                    eval_returncode=eval_returncode,
+                                    train_loss=metrics.get("train_loss"),
+                                    val_loss=metrics.get("val_loss"),
+                                    test_loss=metrics.get("test_loss"),
+                                    test_ppl=metrics.get("test_ppl"),
+                                    it_per_sec=metrics.get("it_per_sec"),
+                                    tokens_per_sec=metrics.get("tokens_per_sec"),
+                                    trained_tokens=metrics.get("trained_tokens"),
+                                    peak_mem_gb=metrics.get("peak_mem_gb"),
+                                    trainable_params_m=metrics.get("trainable_params_m"),
+                                    trainable_pct=metrics.get("trainable_pct"),
+                                    adapter_size_mb=_adapter_size_mb(adapter_path),
+                                    stdout_tail=(train.stdout + eval_stdout)[-4000:],
+                                    stderr_tail=(train.stderr + eval_stderr)[-4000:],
+                                )
+                            )
     return results
 
 

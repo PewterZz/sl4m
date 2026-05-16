@@ -6,6 +6,7 @@ import re
 import subprocess
 import time
 import gc
+import hashlib
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
@@ -283,6 +284,57 @@ def _measure_generation(
     )
 
 
+def _measure_generation_with_tokens(
+    name: str,
+    model: str,
+    prompt: str,
+    fn: Callable[[Session, GenerationSettings], Iterable[Any]],
+    *,
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    headroom_gb: float,
+) -> tuple[BenchmarkResult, list[int], str]:
+    limits = auto_detect_limits(headroom_bytes=int(headroom_gb * 1024**3))
+    budget = StaticBudget(limits)
+    backend = MLXBackend()
+    backend.load(model, None, budget)
+    session = Session(backend=backend, budget=budget, recorder=NullRecorder())
+    settings = GenerationSettings(max_tokens=max_tokens, temperature=temperature, top_p=top_p)
+    tokens: list[int] = []
+    text: list[str] = []
+    first_token_s: Optional[float] = None
+    _reset_peak_memory()
+    t0 = time.monotonic()
+    try:
+        for tok in fn(session, settings):
+            text.append(tok.text)
+            if tok.token_id == -1:
+                continue
+            if first_token_s is None:
+                first_token_s = time.monotonic() - t0
+            tokens.append(int(tok.token_id))
+    finally:
+        elapsed = time.monotonic() - t0
+        peak = _try_peak_memory_gb()
+        session.close()
+        _clear_mlx_cache()
+
+    generated_text = "".join(text)
+    result = BenchmarkResult(
+        name=name,
+        model=model,
+        prompt_chars=len(prompt),
+        tokens=len(tokens),
+        seconds=elapsed,
+        tok_s=(len(tokens) / elapsed) if elapsed > 0 else 0.0,
+        first_token_s=first_token_s,
+        peak_mem_gb=peak,
+        metadata={"text_prefix": generated_text[:200]},
+    )
+    return result, tokens, generated_text
+
+
 def _measure_mlx_lm_direct(
     *,
     model: str,
@@ -336,6 +388,25 @@ def _measure_mlx_lm_direct(
         metadata={"text_prefix": "".join(text)[:200]},
     )
     return result, tokens, "".join(text)
+
+
+def token_sequence_hash(tokens: list[int]) -> str:
+    payload = json.dumps(tokens, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def text_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def first_token_divergence(expected: list[int], observed: list[int]) -> Optional[int]:
+    n = min(len(expected), len(observed))
+    for i in range(n):
+        if expected[i] != observed[i]:
+            return i
+    if len(expected) != len(observed):
+        return n
+    return None
 
 
 def _measure_slam_baseline(
@@ -541,6 +612,149 @@ def run_kv_cache_bench(
                             "kv_group_size": kv_group_size,
                             "quantized_kv_start": quantized_kv_start,
                             "tokens_delta_vs_first": result.tokens - baseline_tokens,
+                        },
+                    }
+                )
+            )
+    return results
+
+
+def run_determinism_bench(
+    *,
+    model: str,
+    prompt: str,
+    modes: list[str],
+    max_tokens: int,
+    temperature: float,
+    repeats: int,
+    headroom_gb: float,
+    top_p: float = 0.95,
+    num_draft: int = 4,
+    max_ngram: int = 3,
+    min_ngram: int = 2,
+    kv_group_size: int = 64,
+    quantized_kv_start: int = 0,
+) -> list[BenchmarkResult]:
+    results: list[BenchmarkResult] = []
+    reference_tokens: dict[str, list[int]] = {}
+    reference_text_hashes: dict[str, str] = {}
+
+    for rep in range(repeats):
+        for mode in modes:
+            normalized = mode.strip().lower()
+            if normalized == "baseline":
+                name = "baseline"
+
+                def fn(session, settings):
+                    return session.generate(prompt, settings)
+
+            elif normalized == "pld":
+                name = "pld"
+
+                def fn(session, settings):
+                    return session.generate_pld_speculative(
+                        prompt,
+                        settings,
+                        num_draft=num_draft,
+                        max_ngram_size=max_ngram,
+                        min_ngram_size=min_ngram,
+                    )
+
+            elif normalized == "adaptive-pld":
+                name = "adaptive-pld"
+
+                def fn(session, settings):
+                    return session.generate_adaptive_pld(
+                        prompt,
+                        settings,
+                        num_draft=num_draft,
+                        max_ngram_size=max_ngram,
+                        min_ngram_size=min_ngram,
+                    )
+
+            elif normalized in {"kv-fp", "kv-none"}:
+                name = "kv-fp"
+
+                def fn(session, settings):
+                    tuned = GenerationSettings(
+                        max_tokens=settings.max_tokens,
+                        temperature=settings.temperature,
+                        top_p=settings.top_p,
+                        kv_bits=None,
+                        kv_group_size=kv_group_size,
+                        quantized_kv_start=quantized_kv_start,
+                    )
+                    return session.generate(prompt, tuned)
+
+            elif normalized in {"kv-8", "kv-8bit"}:
+                name = "kv-8bit"
+
+                def fn(session, settings):
+                    tuned = GenerationSettings(
+                        max_tokens=settings.max_tokens,
+                        temperature=settings.temperature,
+                        top_p=settings.top_p,
+                        kv_bits=8,
+                        kv_group_size=kv_group_size,
+                        quantized_kv_start=quantized_kv_start,
+                    )
+                    return session.generate(prompt, tuned)
+
+            elif normalized in {"kv-4", "kv-4bit"}:
+                name = "kv-4bit"
+
+                def fn(session, settings):
+                    tuned = GenerationSettings(
+                        max_tokens=settings.max_tokens,
+                        temperature=settings.temperature,
+                        top_p=settings.top_p,
+                        kv_bits=4,
+                        kv_group_size=kv_group_size,
+                        quantized_kv_start=quantized_kv_start,
+                    )
+                    return session.generate(prompt, tuned)
+
+            else:
+                raise ValueError(f"unsupported determinism mode: {mode}")
+
+            result, tokens, generated_text = _measure_generation_with_tokens(
+                name,
+                model,
+                prompt,
+                fn,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                headroom_gb=headroom_gb,
+            )
+            current_text_hash = text_hash(generated_text)
+            current_token_hash = token_sequence_hash(tokens)
+            if name not in reference_tokens:
+                reference_tokens[name] = tokens
+                reference_text_hashes[name] = current_text_hash
+            divergence = first_token_divergence(reference_tokens[name], tokens)
+            matches_first = divergence is None and current_text_hash == reference_text_hashes[name]
+            results.append(
+                BenchmarkResult(
+                    **{
+                        **asdict(result),
+                        "metadata": {
+                            **result.metadata,
+                            "repeat": rep,
+                            "temperature": temperature,
+                            "top_p": top_p,
+                            "max_tokens": max_tokens,
+                            "num_draft": num_draft,
+                            "max_ngram": max_ngram,
+                            "min_ngram": min_ngram,
+                            "kv_group_size": kv_group_size,
+                            "quantized_kv_start": quantized_kv_start,
+                            "token_hash": current_token_hash,
+                            "text_hash": current_text_hash,
+                            "matches_first": matches_first,
+                            "first_divergence": divergence,
+                            "reference_token_hash": token_sequence_hash(reference_tokens[name]),
+                            "reference_text_hash": reference_text_hashes[name],
                         },
                     }
                 )

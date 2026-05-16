@@ -110,6 +110,7 @@ slam mlx-adapter-bench \
   --layers 1,2,4 \
   --ranks 4,8,16 \
   --scales 16,20 \
+  --learning-rates 1e-5,2e-5 \
   --iters 2 \
   --batch-size 1 \
   --val-batches 1 \
@@ -122,7 +123,9 @@ peak memory and 10.3 MB adapter size. DoRA-4 was similar quality (`1.972`) but
 used 11.602 GB peak memory, so LoRA is the current default for Mac sweeps.
 Rank/scale sweeps are supported through generated MLX-LM config files; on the
 same smoke set, rank-16/scale-20 was the best 1-layer LoRA point (`2.028` test
-loss) while staying near 6.15 GB peak memory.
+loss) while staying near 6.15 GB peak memory. Learning-rate sweeps are part of
+the same matrix so short adapter searches can compare quality, speed, and memory
+without changing harnesses.
 
 Don't know which draft pair works for your target? `slam spec-sweep` tries
 `num_draft ∈ {1,2,4,6,8}` and prints a ranked table.
@@ -189,6 +192,8 @@ New Mac/MLX training surface:
 - `slam mlx-serve` — OpenAI-compatible local serving through `mlx_lm.server`
 - `slam mac-profile` — captures Mac/MLX runtime metadata for benchmark runs
 - `slam mac-bench` — compares slam Mac generation modes with JSONL output
+- `slam mac-kv-bench` — compares FP/8-bit/4-bit MLX KV cache modes
+- `slam determinism-bench` — repeats baseline/PLD/adaptive/KV modes and records token drift
 - `slam mac-kernel-bench` — benchmarks custom Metal kernels vs MLX reference ops
 
 Mac efficiency work lives in [docs/mac-efficiency-roadmap.md](docs/mac-efficiency-roadmap.md).
@@ -224,6 +229,17 @@ slam mac-kv-bench ~/Tools/models/Huihui-OmniCoder-9B-abliterated-4bit \
   --kv-bits none,8,4 \
   --max-tokens 64 \
   --jsonl runs/kv-bench-omnicoder-9b-smoke.jsonl
+```
+
+For agentic workflows, run deterministic repeat checks before treating an
+optimized mode as production-safe:
+
+```bash
+slam determinism-bench ~/Tools/models/Huihui-OmniCoder-9B-abliterated-4bit \
+  --modes baseline,pld,adaptive-pld,kv-8bit,kv-4bit \
+  --repeats 3 \
+  --temperature 0.0 \
+  --jsonl runs/determinism-omnicoder-9b-smoke.jsonl
 ```
 
 Real-model smoke tests are opt-in so normal CI does not download weights:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from sl4m.mlx_workflow import (
     WorkflowError,
     detect_dataset_format,
     parse_mlx_lora_output,
+    run_adapter_bench,
     summarize_model_config,
     validate_dataset_dir,
 )
@@ -116,6 +118,48 @@ def test_train_recipe_writes_lora_parameter_config(tmp_path: Path) -> None:
 
     assert cfg["lora_parameters"] == {"rank": 16, "scale": 32.0, "dropout": 0.05}
     assert cmd == [sys.executable, "-m", "mlx_lm", "lora", "--config", str(cfg_path)]
+
+
+def test_run_adapter_bench_sweeps_learning_rates(tmp_path: Path, monkeypatch) -> None:
+    data = tmp_path / "data"
+    data.mkdir()
+    _write_jsonl(data / "train.jsonl", [{"text": "hello"}])
+
+    seen_configs: list[dict] = []
+
+    def fake_run(args, capture_output, text, check):
+        assert args[:4] == [sys.executable, "-m", "mlx_lm", "lora"]
+        cfg_path = Path(args[-1])
+        seen_configs.append(json.loads(cfg_path.read_text(encoding="utf-8")))
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout=(
+                "Trainable parameters: 0.007% (0.639M/8953.802M)\n"
+                "Iter 1: Train loss 1.000, Learning Rate 1.000e-05, "
+                "It/sec 1.000, Tokens/sec 10.000, Trained Tokens 10, Peak mem 1.000 GB"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("sl4m.mlx_workflow.subprocess.run", fake_run)
+
+    results = run_adapter_bench(
+        model="mlx-community/test",
+        data=data,
+        output_dir=tmp_path / "runs",
+        fine_tune_types=["lora"],
+        num_layers=[1],
+        ranks=[4],
+        scales=[16],
+        dropouts=[0],
+        learning_rates=[1e-5, 2e-5],
+        iters=1,
+    )
+
+    assert [r.learning_rate for r in results] == [1e-5, 2e-5]
+    assert [cfg["learning_rate"] for cfg in seen_configs] == [1e-5, 2e-5]
+    assert all("lr" in r.name for r in results)
 
 
 def test_train_recipe_from_toml(tmp_path: Path) -> None:

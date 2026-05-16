@@ -99,6 +99,7 @@ slam mlx-adapter-bench \
   --layers 1,2,4 \
   --ranks 4,8,16 \
   --scales 16,20 \
+  --learning-rates 1e-5,2e-5 \
   --iters 2 \
   --batch-size 1 \
   --val-batches 1 \
@@ -135,6 +136,9 @@ Rank/scale sweep, LoRA layer 1:
 The short-run result says rank is worth sweeping before layer count on Mac:
 rank-16/scale-20 matched LoRA-2 quality with lower adapter size and similar
 memory. This is not a final recipe; it is a better next search prior.
+The harness now sweeps learning rates in the same run, which is important for
+adapter quality because rank/scale choices can look better or worse under a
+single under-tuned LR.
 
 ## 2026 KV Direction
 
@@ -161,6 +165,20 @@ tokens:
 At this context length, MLX KV quantization does not move memory or speed. We
 need longer-context agent prompts before TurboQuant-style work can show a real
 memory advantage.
+
+Before promoting any inference fast path, run token-level repeat checks:
+
+```bash
+slam determinism-bench ~/Tools/models/Huihui-OmniCoder-9B-abliterated-4bit \
+  --modes baseline,pld,adaptive-pld,kv-8bit,kv-4bit \
+  --repeats 3 \
+  --temperature 0.0 \
+  --jsonl runs/determinism-omnicoder-9b-smoke.jsonl
+```
+
+The JSONL records include token/text hashes, `matches_first`, and the first
+divergent token index for each mode. That gives the agentic path a correctness
+gate before speed numbers are trusted.
 
 ## Generation Benchmarks
 

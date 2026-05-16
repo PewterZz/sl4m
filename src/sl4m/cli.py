@@ -29,6 +29,7 @@ from .mac_efficiency import (
     build_mac_acceleration_plan,
     collect_mac_profile,
     compare_mlx_lm_vs_slam,
+    run_determinism_bench,
     run_fused_silu_mul_bench,
     run_kv_cache_bench,
     run_mlx_generation_bench,
@@ -421,10 +422,10 @@ def mlx_adapter_bench(
     ranks: str = typer.Option("8", help="Comma-separated LoRA ranks, e.g. 4,8,16"),
     scales: str = typer.Option("20", help="Comma-separated LoRA alpha/scale values"),
     dropouts: str = typer.Option("0", help="Comma-separated LoRA dropout values"),
+    learning_rates: str = typer.Option("1e-5", help="Comma-separated learning rates"),
     iters: int = typer.Option(2),
     batch_size: int = typer.Option(1),
     grad_accumulation_steps: int = typer.Option(1),
-    learning_rate: float = typer.Option(1e-5),
     optimizer: Optional[str] = typer.Option(None),
     val_batches: int = typer.Option(1),
     test_batches: int = typer.Option(1),
@@ -440,6 +441,9 @@ def mlx_adapter_bench(
         selected_ranks = [int(x.strip()) for x in ranks.split(",") if x.strip()]
         selected_scales = [float(x.strip()) for x in scales.split(",") if x.strip()]
         selected_dropouts = [float(x.strip()) for x in dropouts.split(",") if x.strip()]
+        selected_learning_rates = [
+            float(x.strip()) for x in learning_rates.split(",") if x.strip()
+        ]
         results = run_adapter_bench(
             model=model,
             data=Path(data),
@@ -449,10 +453,10 @@ def mlx_adapter_bench(
             ranks=selected_ranks,
             scales=selected_scales,
             dropouts=selected_dropouts,
+            learning_rates=selected_learning_rates,
             iters=iters,
             batch_size=batch_size,
             grad_accumulation_steps=grad_accumulation_steps,
-            learning_rate=learning_rate,
             optimizer=optimizer,
             val_batches=val_batches,
             test_batches=test_batches,
@@ -469,6 +473,7 @@ def mlx_adapter_bench(
         "name",
         "rank",
         "scale",
+        "lr",
         "rc",
         "eval",
         "train loss",
@@ -484,6 +489,7 @@ def mlx_adapter_bench(
             result.name,
             str(result.rank or "n/a"),
             "n/a" if result.scale is None else f"{result.scale:g}",
+            f"{result.learning_rate:g}",
             str(result.train_returncode),
             "n/a" if result.eval_returncode is None else str(result.eval_returncode),
             "n/a" if result.train_loss is None else f"{result.train_loss:.3f}",
@@ -677,6 +683,68 @@ def mac_kv_bench(
             f"{r.tok_s:.2f}",
             f"{(r.first_token_s or 0.0):.3f}",
             f"{r.peak_mem_gb:.2f}" if r.peak_mem_gb is not None else "n/a",
+        )
+    console.print(table)
+    if jsonl:
+        write_jsonl(jsonl, [r.to_record() for r in results])
+
+
+@app.command("determinism-bench")
+def determinism_bench(
+    model: str = typer.Argument(..., help="HF repo id or local MLX model path"),
+    prompt: str = typer.Option(
+        "Return a deterministic JSON object with keys task, plan, and risks.",
+    ),
+    modes: str = typer.Option(
+        "baseline,pld,adaptive-pld,kv-8bit,kv-4bit",
+        help="Comma-separated: baseline,pld,adaptive-pld,kv-fp,kv-8bit,kv-4bit",
+    ),
+    max_tokens: int = typer.Option(128),
+    temperature: float = typer.Option(0.0),
+    top_p: float = typer.Option(0.95),
+    repeats: int = typer.Option(3),
+    num_draft: int = typer.Option(4),
+    max_ngram: int = typer.Option(3),
+    min_ngram: int = typer.Option(2),
+    kv_group_size: int = typer.Option(64),
+    quantized_kv_start: int = typer.Option(0),
+    headroom_gb: float = typer.Option(4.0),
+    jsonl: Optional[str] = typer.Option(None),
+):
+    """Check token-level repeatability of slam inference modes."""
+    selected = [m.strip() for m in modes.split(",") if m.strip()]
+    results = run_determinism_bench(
+        model=model,
+        prompt=prompt,
+        modes=selected,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        repeats=repeats,
+        headroom_gb=headroom_gb,
+        num_draft=num_draft,
+        max_ngram=max_ngram,
+        min_ngram=min_ngram,
+        kv_group_size=kv_group_size,
+        quantized_kv_start=quantized_kv_start,
+    )
+    table = Table(title="Determinism benchmark")
+    for col in ("mode", "repeat", "tokens", "tok/s", "match", "diverge", "hash"):
+        table.add_column(
+            col,
+            justify="right" if col in {"repeat", "tokens", "tok/s", "diverge"} else "left",
+        )
+    for r in results:
+        table.add_row(
+            r.name,
+            str(r.metadata["repeat"]),
+            str(r.tokens),
+            f"{r.tok_s:.2f}",
+            "yes" if r.metadata["matches_first"] else "no",
+            "n/a"
+            if r.metadata["first_divergence"] is None
+            else str(r.metadata["first_divergence"]),
+            str(r.metadata["token_hash"])[:12],
         )
     console.print(table)
     if jsonl:
