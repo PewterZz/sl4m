@@ -97,6 +97,8 @@ slam mlx-adapter-bench \
   --data benchmarks/finetune_smoke \
   --fine-tune-types lora,dora \
   --layers 1,2,4 \
+  --ranks 4,8,16 \
+  --scales 16,20 \
   --iters 2 \
   --batch-size 1 \
   --val-batches 1 \
@@ -119,6 +121,21 @@ This dataset is intentionally too small for quality claims. The actionable
 systems result is that DoRA works on Mac/MLX but has a steep unified-memory
 cost; LoRA-4 is the current default for larger local sweeps.
 
+Rank/scale sweep, LoRA layer 1:
+
+| rank | scale | test loss | tok/s | peak GB | adapter MB |
+|---:|---:|---:|---:|---:|---:|
+| 4 | 16 | 2.062 | 21.48 | 6.146 | 1.22 |
+| 4 | 20 | 2.061 | 25.34 | 6.146 | 1.22 |
+| 8 | 16 | 2.049 | 24.79 | 6.148 | 2.44 |
+| 8 | 20 | 2.045 | 25.12 | 6.148 | 2.44 |
+| 16 | 16 | 2.043 | 24.52 | 6.152 | 4.88 |
+| 16 | 20 | **2.028** | 25.23 | 6.152 | 4.88 |
+
+The short-run result says rank is worth sweeping before layer count on Mac:
+rank-16/scale-20 matched LoRA-2 quality with lower adapter size and similar
+memory. This is not a final recipe; it is a better next search prior.
+
 ## 2026 KV Direction
 
 TurboQuant is relevant for long-context inference, not adapter training. Its
@@ -131,6 +148,19 @@ right next step is a Mac KV harness:
 2. compare MLX built-in `--kv-bits 4/8` against baseline output identity and perplexity
 3. prototype TurboQuant-style rotated KV packing/unpacking in MLX arrays
 4. only then move the hot path into custom Metal kernels
+
+First smoke run on OmniCoder 9B with a 3.2k-character prompt and 64 generated
+tokens:
+
+| mode | tok/s | TTFT | peak GB |
+|---|---:|---:|---:|
+| FP KV | 5.09 | 8.657s | 6.414 |
+| 8-bit KV | 5.06 | 8.669s | 6.414 |
+| 4-bit KV | 5.07 | 8.658s | 6.414 |
+
+At this context length, MLX KV quantization does not move memory or speed. We
+need longer-context agent prompts before TurboQuant-style work can show a real
+memory advantage.
 
 ## Generation Benchmarks
 

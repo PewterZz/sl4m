@@ -98,6 +98,26 @@ def test_train_recipe_command_includes_hard_test_knobs(tmp_path: Path) -> None:
     assert cmd[cmd.index("--clear-cache-threshold") + 1] == "1000000"
 
 
+def test_train_recipe_writes_lora_parameter_config(tmp_path: Path) -> None:
+    _write_jsonl(tmp_path / "train.jsonl", [{"text": "hello"}])
+    cfg_path = tmp_path / "adapter" / "slam_lora_config.json"
+
+    recipe = TrainRecipe(
+        model="mlx-community/test",
+        data=tmp_path,
+        adapter_path=tmp_path / "adapter",
+        lora_rank=16,
+        lora_scale=32.0,
+        lora_dropout=0.05,
+    ).write_config(cfg_path)
+
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    cmd = recipe.to_command()
+
+    assert cfg["lora_parameters"] == {"rank": 16, "scale": 32.0, "dropout": 0.05}
+    assert cmd == [sys.executable, "-m", "mlx_lm", "lora", "--config", str(cfg_path)]
+
+
 def test_train_recipe_from_toml(tmp_path: Path) -> None:
     _write_jsonl(tmp_path / "train.jsonl", [{"text": "hello"}])
     recipe_path = tmp_path / "recipe.toml"

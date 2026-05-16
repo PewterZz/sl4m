@@ -108,6 +108,8 @@ slam mlx-adapter-bench \
   --output-dir runs/adapter-bench/omnicoder-9b-smoke \
   --fine-tune-types lora,dora \
   --layers 1,2,4 \
+  --ranks 4,8,16 \
+  --scales 16,20 \
   --iters 2 \
   --batch-size 1 \
   --val-batches 1 \
@@ -118,6 +120,9 @@ slam mlx-adapter-bench \
 Initial 9B smoke matrix: LoRA-4 gave the best test loss (`1.968`) at 6.879 GB
 peak memory and 10.3 MB adapter size. DoRA-4 was similar quality (`1.972`) but
 used 11.602 GB peak memory, so LoRA is the current default for Mac sweeps.
+Rank/scale sweeps are supported through generated MLX-LM config files; on the
+same smoke set, rank-16/scale-20 was the best 1-layer LoRA point (`2.028` test
+loss) while staying near 6.15 GB peak memory.
 
 Don't know which draft pair works for your target? `slam spec-sweep` tries
 `num_draft ∈ {1,2,4,6,8}` and prints a ranked table.
@@ -213,6 +218,13 @@ slam mac-norm-bench --rows 256 --hidden 4096 --repeats 50
 track, not the adapter-training track. The practical sl4m next step is a
 TurboQuant-inspired KV harness for long-context agent cache memory and quality
 before attempting custom Metal cache kernels.
+
+```bash
+slam mac-kv-bench ~/Tools/models/Huihui-OmniCoder-9B-abliterated-4bit \
+  --kv-bits none,8,4 \
+  --max-tokens 64 \
+  --jsonl runs/kv-bench-omnicoder-9b-smoke.jsonl
+```
 
 Real-model smoke tests are opt-in so normal CI does not download weights:
 

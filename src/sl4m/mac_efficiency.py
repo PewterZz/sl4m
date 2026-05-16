@@ -490,6 +490,64 @@ def run_mlx_generation_bench(
     return results
 
 
+def run_kv_cache_bench(
+    *,
+    model: str,
+    prompt: str,
+    kv_bits: list[Optional[int]],
+    max_tokens: int,
+    temperature: float,
+    repeats: int,
+    headroom_gb: float,
+    kv_group_size: int = 64,
+    quantized_kv_start: int = 0,
+) -> list[BenchmarkResult]:
+    results: list[BenchmarkResult] = []
+    for rep in range(repeats):
+        baseline_tokens: Optional[int] = None
+        for bits in kv_bits:
+            name = "kv-fp" if bits is None else f"kv-{bits}bit"
+
+            def fn(session, settings, bits=bits):
+                tuned = GenerationSettings(
+                    max_tokens=settings.max_tokens,
+                    temperature=settings.temperature,
+                    top_p=settings.top_p,
+                    kv_bits=bits,
+                    kv_group_size=kv_group_size,
+                    quantized_kv_start=quantized_kv_start,
+                )
+                return session.generate(prompt, tuned)
+
+            result = _measure_generation(
+                name,
+                model,
+                prompt,
+                fn,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                headroom_gb=headroom_gb,
+            )
+            if baseline_tokens is None:
+                baseline_tokens = result.tokens
+            results.append(
+                BenchmarkResult(
+                    **{
+                        **asdict(result),
+                        "metadata": {
+                            **result.metadata,
+                            "repeat": rep,
+                            "kv_bits": bits,
+                            "kv_group_size": kv_group_size,
+                            "quantized_kv_start": quantized_kv_start,
+                            "tokens_delta_vs_first": result.tokens - baseline_tokens,
+                        },
+                    }
+                )
+            )
+    return results
+
+
 def run_command_benchmark(
     name: str,
     command: list[str],

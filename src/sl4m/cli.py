@@ -30,6 +30,7 @@ from .mac_efficiency import (
     collect_mac_profile,
     compare_mlx_lm_vs_slam,
     run_fused_silu_mul_bench,
+    run_kv_cache_bench,
     run_mlx_generation_bench,
     run_rms_norm_bench,
     summarize_by_best,
@@ -417,6 +418,9 @@ def mlx_adapter_bench(
     output_dir: str = typer.Option("runs/adapter-bench"),
     fine_tune_types: str = typer.Option("lora,dora", help="Comma-separated: lora,dora,full"),
     layers: str = typer.Option("1,2", help="Comma-separated layer counts, e.g. 1,2,4"),
+    ranks: str = typer.Option("8", help="Comma-separated LoRA ranks, e.g. 4,8,16"),
+    scales: str = typer.Option("20", help="Comma-separated LoRA alpha/scale values"),
+    dropouts: str = typer.Option("0", help="Comma-separated LoRA dropout values"),
     iters: int = typer.Option(2),
     batch_size: int = typer.Option(1),
     grad_accumulation_steps: int = typer.Option(1),
@@ -433,12 +437,18 @@ def mlx_adapter_bench(
         ensure_macos()
         selected_types = [x.strip() for x in fine_tune_types.split(",") if x.strip()]
         selected_layers = [int(x.strip()) for x in layers.split(",") if x.strip()]
+        selected_ranks = [int(x.strip()) for x in ranks.split(",") if x.strip()]
+        selected_scales = [float(x.strip()) for x in scales.split(",") if x.strip()]
+        selected_dropouts = [float(x.strip()) for x in dropouts.split(",") if x.strip()]
         results = run_adapter_bench(
             model=model,
             data=Path(data),
             output_dir=Path(output_dir),
             fine_tune_types=selected_types,
             num_layers=selected_layers,
+            ranks=selected_ranks,
+            scales=selected_scales,
+            dropouts=selected_dropouts,
             iters=iters,
             batch_size=batch_size,
             grad_accumulation_steps=grad_accumulation_steps,
@@ -457,6 +467,8 @@ def mlx_adapter_bench(
     table = Table(title="MLX adapter benchmark")
     for col in (
         "name",
+        "rank",
+        "scale",
         "rc",
         "eval",
         "train loss",
@@ -470,6 +482,8 @@ def mlx_adapter_bench(
     for result in results:
         table.add_row(
             result.name,
+            str(result.rank or "n/a"),
+            "n/a" if result.scale is None else f"{result.scale:g}",
             str(result.train_returncode),
             "n/a" if result.eval_returncode is None else str(result.eval_returncode),
             "n/a" if result.train_loss is None else f"{result.train_loss:.3f}",
@@ -620,6 +634,53 @@ def mac_bench(
                 console.print(f"[green]{r.name} vs {baseline.name}: {r.tok_s / baseline.tok_s:.2f}×[/green]")
     if jsonl:
         write_jsonl(jsonl, results)
+
+
+@app.command("mac-kv-bench")
+def mac_kv_bench(
+    model: str = typer.Argument(..., help="HF repo id or local MLX model path"),
+    prompt: str = typer.Option(
+        "Summarize the following codebase notes, then propose three refactors.\n" * 80,
+    ),
+    kv_bits: str = typer.Option("none,8,4", help="Comma-separated KV modes: none,8,4"),
+    max_tokens: int = typer.Option(128),
+    temperature: float = typer.Option(0.0),
+    repeats: int = typer.Option(1),
+    kv_group_size: int = typer.Option(64),
+    quantized_kv_start: int = typer.Option(0),
+    headroom_gb: float = typer.Option(4.0),
+    jsonl: Optional[str] = typer.Option(None),
+):
+    """Benchmark MLX KV-cache quantization as the baseline for TurboQuant work."""
+    selected_bits: list[Optional[int]] = []
+    for item in (x.strip().lower() for x in kv_bits.split(",") if x.strip()):
+        selected_bits.append(None if item in {"none", "fp", "bf16", "fp16"} else int(item))
+    results = run_kv_cache_bench(
+        model=model,
+        prompt=prompt,
+        kv_bits=selected_bits,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        repeats=repeats,
+        headroom_gb=headroom_gb,
+        kv_group_size=kv_group_size,
+        quantized_kv_start=quantized_kv_start,
+    )
+    table = Table(title="Mac KV cache benchmark")
+    for col in ("mode", "tokens", "seconds", "tok/s", "ttft", "peak GB"):
+        table.add_column(col, justify="right" if col != "mode" else "left")
+    for r in results:
+        table.add_row(
+            r.name,
+            str(r.tokens),
+            f"{r.seconds:.2f}",
+            f"{r.tok_s:.2f}",
+            f"{(r.first_token_s or 0.0):.3f}",
+            f"{r.peak_mem_gb:.2f}" if r.peak_mem_gb is not None else "n/a",
+        )
+    console.print(table)
+    if jsonl:
+        write_jsonl(jsonl, [r.to_record() for r in results])
 
 
 @app.command("mac-compare")

@@ -9,6 +9,7 @@ from sl4m.mac_efficiency import (
     compare_mlx_lm_vs_slam,
     collect_mac_profile,
     detect_apple_chip_generation,
+    run_kv_cache_bench,
     summarize_by_best,
     write_jsonl,
 )
@@ -146,6 +147,34 @@ def test_compare_mlx_lm_vs_slam_records_divergence(monkeypatch) -> None:
 
     assert results[0].metadata["token_identity"] is False
     assert results[0].metadata["token_prefix_match"] == 1
+
+
+def test_run_kv_cache_bench_records_modes(monkeypatch) -> None:
+    def measure(name, model, prompt, fn, *, max_tokens, temperature, headroom_gb):
+        return BenchmarkResult(
+            name=name,
+            model=model,
+            prompt_chars=len(prompt),
+            tokens=max_tokens,
+            seconds=1.0,
+            tok_s=float(max_tokens),
+            peak_mem_gb=1.0,
+        )
+
+    monkeypatch.setattr("sl4m.mac_efficiency._measure_generation", measure)
+
+    results = run_kv_cache_bench(
+        model="m",
+        prompt="p",
+        kv_bits=[None, 8, 4],
+        max_tokens=3,
+        temperature=0.0,
+        repeats=1,
+        headroom_gb=4.0,
+    )
+
+    assert [r.name for r in results] == ["kv-fp", "kv-8bit", "kv-4bit"]
+    assert [r.metadata["kv_bits"] for r in results] == [None, 8, 4]
 
 
 def test_fused_silu_mul_kernel_source_contains_bounds_and_fusion() -> None:
